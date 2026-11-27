@@ -31,6 +31,10 @@ const historyCache = new Map<
   { days: DailyObservation[]; endDate: string; timezone: string }
 >()
 
+/** Persistent browser Cache API layer (survives reloads, bounded to 12 places). */
+const PERSISTENT_CACHE_NAME = 'analog-weather-archive-v1'
+const PERSISTENT_CACHE_MAX = 12
+
 /** Dedupe concurrent loads (React Strict Mode, rapid re-select). */
 type InflightEntry = {
   promise: Promise<DailyHistory>
@@ -115,6 +119,121 @@ function cacheSet(
     const oldest = historyCache.keys().next().value
     if (oldest === undefined) break
     historyCache.delete(oldest)
+  }
+}
+
+function persistentCacheUrl(place: Place, archiveEnd: string): string {
+  const lat = place.latitude.toFixed(2)
+  const lon = place.longitude.toFixed(2)
+  return `https://cache.local/archive/${lat},${lon}/${archiveEnd}`
+}
+
+function extractArchiveEnd(url: string): string | null {
+  try {
+    const { pathname } = new URL(url)
+    const match = /^\/archive\/[^/]+\/(\d{4}-\d{2}-\d{2})$/.exec(pathname)
+    return match ? match[1]! : null
+  } catch {
+    return null
+  }
+}
+
+function isNullableFiniteNumber(value: unknown): value is number | null {
+  return value === null || (typeof value === 'number' && Number.isFinite(value))
+}
+
+function isValidDailyHistory(
+  value: unknown,
+  expectedArchiveEnd: string,
+): value is DailyHistory {
+  if (typeof value !== 'object' || value === null) return false
+  const record = value as Record<string, unknown>
+  if (record.archiveEnd !== expectedArchiveEnd) return false
+  if (typeof record.timezone !== 'string' || record.timezone.length === 0) {
+    return false
+  }
+  if (!Array.isArray(record.days) || record.days.length === 0) return false
+  for (const day of record.days) {
+    if (typeof day !== 'object' || day === null) return false
+    const obs = day as Record<string, unknown>
+    if (
+      typeof obs.date !== 'string' ||
+      !isNullableFiniteNumber(obs.tMax) ||
+      !isNullableFiniteNumber(obs.tMin) ||
+      !isNullableFiniteNumber(obs.precip)
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
+async function openPersistentCache(): Promise<Cache | null> {
+  if (typeof caches === 'undefined') return null
+  try {
+    return await caches.open(PERSISTENT_CACHE_NAME)
+  } catch {
+    return null
+  }
+}
+
+async function persistentCacheGet(
+  place: Place,
+  archiveEnd: string,
+): Promise<DailyHistory | null> {
+  const cache = await openPersistentCache()
+  if (!cache) return null
+  try {
+    const url = persistentCacheUrl(place, archiveEnd)
+    const res = await cache.match(url)
+    if (!res || !res.ok) return null
+    const parsed: unknown = await res.json()
+    if (!isValidDailyHistory(parsed, archiveEnd)) {
+      await cache.delete(url).catch(() => {})
+      return null
+    }
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+async function persistentCacheSet(
+  place: Place,
+  history: DailyHistory,
+): Promise<void> {
+  const cache = await openPersistentCache()
+  if (!cache) return
+  try {
+    const url = persistentCacheUrl(place, history.archiveEnd)
+    await cache.delete(url)
+    await cache.put(
+      url,
+      new Response(JSON.stringify(history), {
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+
+    const keys = await cache.keys()
+    const kept: Request[] = []
+    for (const req of keys) {
+      const entryEnd = extractArchiveEnd(req.url)
+      if (entryEnd && entryEnd < history.archiveEnd) {
+        await cache.delete(req)
+      } else {
+        kept.push(req)
+      }
+    }
+
+    let excess = kept.length - PERSISTENT_CACHE_MAX
+    for (const req of kept) {
+      if (excess <= 0) break
+      if (req.url === url) continue
+      await cache.delete(req)
+      excess -= 1
+    }
+  } catch {
+    // Ignore storage/quota/privacy-mode errors and rely on in-memory LRU.
   }
 }
 
@@ -272,13 +391,31 @@ export function fetchDailyHistory(
       controller,
       subscribers: 0,
     }
-    created.promise = fetchFullHistory(place, archiveEnd, controller.signal)
-      .then(({ days, timezone }) => {
-        cacheSet(key, { days, endDate: archiveEnd, timezone })
+    created.promise = (async (): Promise<DailyHistory> => {
+      const persisted = await persistentCacheGet(place, archiveEnd)
+      if (persisted) {
+        cacheSet(key, {
+          days: persisted.days,
+          endDate: persisted.archiveEnd,
+          timezone: persisted.timezone,
+        })
+        return persisted
+      }
+      const { days, timezone } = await fetchFullHistory(
+        place,
+        archiveEnd,
+        controller.signal,
+      )
+      const history: DailyHistory = { days, archiveEnd, timezone }
+      cacheSet(key, { days, endDate: archiveEnd, timezone })
+      await persistentCacheSet(place, history)
+      return history
+    })()
+      .then((history) => {
         if (inflightByKey.get(key) === created) {
           inflightByKey.delete(key)
         }
-        return { days, archiveEnd, timezone }
+        return history
       })
       .catch((err) => {
         if (inflightByKey.get(key) === created) {
