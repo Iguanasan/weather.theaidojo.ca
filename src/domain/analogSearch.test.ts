@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict'
 import {
   findAnalogEpisodes,
   findAnalogEpisodesInSlice,
@@ -52,33 +53,34 @@ const results = findAnalogEpisodes(historyWithFocal, focal, {
   topN: 10,
 })
 
-console.assert(results.length >= 2, `should find several analogs, got ${results.length}`)
-console.assert(
-  results[0]!.year === 2018,
+assert.ok(results.length >= 2, `should find several analogs, got ${results.length}`)
+assert.equal(
+  results[0]!.year,
+  2018,
   `expected most recent (2018) first, got ${results[0]?.year}`,
 )
-console.assert(
+assert.ok(
   results.every((r, i) => i === 0 || results[i - 1]!.endDate >= r.endDate),
   'should be sorted newest-first by endDate',
 )
-console.assert(
+assert.ok(
   !results.some((r) => r.year === 2010 || r.year === 2012),
   'cold years should fail similarity cutoff',
 )
-console.assert(
+assert.ok(
   results.every((r) => r.matchStrength >= 50),
   'all results should meet default min match strength',
 )
-console.assert(
+assert.ok(
   !results.some((r) => r.startDate >= '2020-07-01' && r.endDate <= '2020-07-07'),
   'should not include overlapping focal window as self',
 )
-console.assert(matchStrengthFromDistance(0) > matchStrengthFromDistance(2), 'closer = higher match')
+assert.ok(matchStrengthFromDistance(0) > matchStrengthFromDistance(2), 'closer = higher match')
 
 // Signed deltas: 2018 is slightly warmer base → positive high/low delta vs focal
 const y2018 = results.find((r) => r.year === 2018)!
 const deltas = seriesDeltas(y2018.series, focal)
-console.assert(deltas.highDelta > 0, '2018 should be slightly warmer (positive high delta)')
+assert.ok(deltas.highDelta > 0, '2018 should be slightly warmer (positive high delta)')
 
 const strict = findAnalogEpisodes(historyWithFocal, focal, {
   length: 7,
@@ -86,7 +88,7 @@ const strict = findAnalogEpisodes(historyWithFocal, focal, {
   focalEnd: '2020-07-07',
   minMatchStrength: 99.5,
 })
-console.assert(strict.length <= results.length, 'stricter cutoff returns fewer or equal')
+assert.ok(strict.length <= results.length, 'stricter cutoff returns fewer or equal')
 
 // Progressive merge: score a recent slice, then an older slice, combine
 const recentSlice = findAnalogEpisodesInSlice(
@@ -106,12 +108,13 @@ const olderSlice = findAnalogEpisodesInSlice(yearDays(2015, 20, 5), focal, {
   topN: 10,
 })
 const merged = mergeAnalogEpisodes(recentSlice, olderSlice, 10)
-console.assert(
+assert.ok(
   merged.some((r) => r.year === 2018) && merged.some((r) => r.year === 2015),
   'merge should keep winners from both progressive slices',
 )
-console.assert(
-  merged[0]!.year === 2018,
+assert.equal(
+  merged[0]!.year,
+  2018,
   'merged list should still prefer more recent end dates first',
 )
 
