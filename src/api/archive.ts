@@ -1,4 +1,23 @@
 import type { DailyObservation, Place } from '../domain/types'
+import { compareIsoDates } from '../lib/dates'
+import {
+  ARCHIVE_START,
+  ARCHIVE_START_YEAR,
+  DELTA_OVERLAP_DAYS,
+  RECENT_WINDOW_YEARS,
+  isValidCachedHistory,
+  mergeDailyObservations,
+  planArchiveFetch,
+  type CachedDailyHistory,
+} from './archiveMerge'
+
+export {
+  ARCHIVE_START,
+  ARCHIVE_START_YEAR,
+  DELTA_OVERLAP_DAYS,
+  RECENT_WINDOW_YEARS,
+  type CachedDailyHistory,
+}
 
 type ArchiveResponse = {
   daily?: {
@@ -10,9 +29,6 @@ type ArchiveResponse = {
   timezone?: string
 }
 
-export const ARCHIVE_START_YEAR = 1940
-export const ARCHIVE_START = `${ARCHIVE_START_YEAR}-01-01`
-
 /**
  * Open-Meteo free / open-access guidance (terms + pricing):
  * - Non-commercial use
@@ -20,32 +36,29 @@ export const ARCHIVE_START = `${ARCHIVE_START_YEAR}-01-01`
  * - Attribution under CC BY 4.0
  * - Prefer fewer, larger requests; cache; avoid hammering after 429
  *
- * We make at most one archive call per place (full history), share in-flight
- * work across remounts, cache complete results, and back off on 429.
+ * We cache persistently in Cache API v2 keyed by 2-decimal place coords,
+ * share in-flight work across remounts, fetch only small tail deltas on return
+ * visits, load recent 20 years first on cold visits, and back off on 429.
  */
 
-/** In-memory cache of complete histories. */
 const HISTORY_CACHE_MAX = 8
-const historyCache = new Map<
-  string,
-  { days: DailyObservation[]; endDate: string; timezone: string }
->()
+const historyCache = new Map<string, CachedDailyHistory>()
 
-/** Persistent browser Cache API layer (survives reloads, bounded to 12 places). */
-const PERSISTENT_CACHE_NAME = 'analog-weather-archive-v1'
+const PERSISTENT_CACHE_NAME = 'analog-weather-archive-v2'
+const LEGACY_CACHE_NAME = 'analog-weather-archive-v1'
 const PERSISTENT_CACHE_MAX = 12
 
-/** Dedupe concurrent loads (React Strict Mode, rapid re-select). */
-type InflightEntry = {
-  promise: Promise<DailyHistory>
-  controller: AbortController
-  subscribers: number
-}
+let legacyCleanupDone = false
+let legacyCleanupPromise: Promise<void> | null = null
 
-const inflightByKey = new Map<string, InflightEntry>()
+export type HistoryLoadPhase =
+  | 'loading'
+  | 'refreshing'
+  | 'backfilling'
+  | 'complete'
 
 export type DailyHistory = {
-  /** Complete daily observations loaded, chronological (oldest → newest). */
+  /** Complete or partial daily observations loaded, chronological (oldest → newest). */
   days: DailyObservation[]
   archiveEnd: string
   timezone: string
@@ -73,6 +86,29 @@ export class WeatherArchiveError extends Error {
   }
 }
 
+export type UserHistoryError = {
+  title: string
+  detail: string
+  kind: WeatherArchiveError['kind'] | 'unknown'
+}
+
+export type DailyHistoryUpdate = DailyHistory & {
+  coverageStart: string
+  isComplete: boolean
+  phase: HistoryLoadPhase
+  backgroundError?: UserHistoryError | null
+}
+
+type InflightEntry = {
+  promise: Promise<DailyHistoryUpdate>
+  controller: AbortController
+  subscribers: number
+  listeners: Set<(update: DailyHistoryUpdate) => void>
+  lastUpdate: DailyHistoryUpdate | null
+}
+
+const inflightByKey = new Map<string, InflightEntry>()
+
 export const OPEN_METEO_TERMS_URL = 'https://open-meteo.com/en/terms'
 
 export const RATE_LIMIT_TITLE = 'The weather archive needs a short break'
@@ -89,19 +125,63 @@ export const RATE_LIMIT_HINT =
   'We only ask the archive once per place and remember the answer afterward. ' +
   'Full terms: open-meteo.com/en/terms'
 
-function yesterdayUtc(): string {
+function defaultYesterdayUtc(): string {
   const d = new Date()
   d.setUTCDate(d.getUTCDate() - 1)
   return d.toISOString().slice(0, 10)
 }
 
-function cacheKey(place: Place, endDate: string): string {
-  const lat = place.latitude.toFixed(2)
-  const lon = place.longitude.toFixed(2)
-  return `${lat},${lon}|${endDate}`
+const DEFAULT_MIN_RETRY_DELAY_MS = 15_000
+const DEFAULT_RETRY_DELAY_MS = 20_000
+
+let getNow = () => Date.now()
+let getYesterdayUtc = defaultYesterdayUtc
+let minRetryDelayMs = DEFAULT_MIN_RETRY_DELAY_MS
+let defaultRetryDelayMs = DEFAULT_RETRY_DELAY_MS
+
+/** @internal Testability overrides for deterministic unit tests. */
+export function configureArchiveForTest(overrides: {
+  now?: () => number
+  yesterdayUtc?: () => string
+  minRetryDelayMs?: number
+  defaultRetryDelayMs?: number
+}) {
+  if (overrides.now) getNow = overrides.now
+  if (overrides.yesterdayUtc) getYesterdayUtc = overrides.yesterdayUtc
+  if (overrides.minRetryDelayMs !== undefined) {
+    minRetryDelayMs = overrides.minRetryDelayMs
+  }
+  if (overrides.defaultRetryDelayMs !== undefined) {
+    defaultRetryDelayMs = overrides.defaultRetryDelayMs
+  }
 }
 
-function cacheGet(key: string) {
+/** @internal Reset in-memory state and test overrides between unit tests. */
+export function resetArchiveForTest() {
+  historyCache.clear()
+  inflightByKey.clear()
+  legacyCleanupDone = false
+  legacyCleanupPromise = null
+  getNow = () => Date.now()
+  getYesterdayUtc = defaultYesterdayUtc
+  minRetryDelayMs = DEFAULT_MIN_RETRY_DELAY_MS
+  defaultRetryDelayMs = DEFAULT_RETRY_DELAY_MS
+}
+
+function formatCoord(n: number): string {
+  const normalized = Math.abs(n) < 0.005 ? 0 : n
+  return normalized.toFixed(2)
+}
+
+function locationKey(place: Place): string {
+  return `${formatCoord(place.latitude)},${formatCoord(place.longitude)}`
+}
+
+function persistentCacheUrl(place: Place): string {
+  return `https://cache.local/archive/${locationKey(place)}`
+}
+
+function cacheGet(key: string): CachedDailyHistory | null {
   const hit = historyCache.get(key)
   if (!hit) return null
   historyCache.delete(key)
@@ -109,10 +189,7 @@ function cacheGet(key: string) {
   return hit
 }
 
-function cacheSet(
-  key: string,
-  value: { days: DailyObservation[]; endDate: string; timezone: string },
-) {
+function cacheSet(key: string, value: CachedDailyHistory) {
   if (historyCache.has(key)) historyCache.delete(key)
   historyCache.set(key, value)
   while (historyCache.size > HISTORY_CACHE_MAX) {
@@ -122,55 +199,20 @@ function cacheSet(
   }
 }
 
-function persistentCacheUrl(place: Place, archiveEnd: string): string {
-  const lat = place.latitude.toFixed(2)
-  const lon = place.longitude.toFixed(2)
-  return `https://cache.local/archive/${lat},${lon}/${archiveEnd}`
-}
-
-function extractArchiveEnd(url: string): string | null {
-  try {
-    const { pathname } = new URL(url)
-    const match = /^\/archive\/[^/]+\/(\d{4}-\d{2}-\d{2})$/.exec(pathname)
-    return match ? match[1]! : null
-  } catch {
-    return null
-  }
-}
-
-function isNullableFiniteNumber(value: unknown): value is number | null {
-  return value === null || (typeof value === 'number' && Number.isFinite(value))
-}
-
-function isValidDailyHistory(
-  value: unknown,
-  expectedArchiveEnd: string,
-): value is DailyHistory {
-  if (typeof value !== 'object' || value === null) return false
-  const record = value as Record<string, unknown>
-  if (record.archiveEnd !== expectedArchiveEnd) return false
-  if (typeof record.timezone !== 'string' || record.timezone.length === 0) {
-    return false
-  }
-  if (!Array.isArray(record.days) || record.days.length === 0) return false
-  for (const day of record.days) {
-    if (typeof day !== 'object' || day === null) return false
-    const obs = day as Record<string, unknown>
-    if (
-      typeof obs.date !== 'string' ||
-      !isNullableFiniteNumber(obs.tMax) ||
-      !isNullableFiniteNumber(obs.tMin) ||
-      !isNullableFiniteNumber(obs.precip)
-    ) {
-      return false
-    }
-  }
-  return true
-}
-
 async function openPersistentCache(): Promise<Cache | null> {
   if (typeof caches === 'undefined') return null
   try {
+    if (!legacyCleanupDone) {
+      if (!legacyCleanupPromise) {
+        legacyCleanupPromise = caches
+          .delete(LEGACY_CACHE_NAME)
+          .catch(() => false)
+          .then(() => {
+            legacyCleanupDone = true
+          })
+      }
+      await legacyCleanupPromise
+    }
     return await caches.open(PERSISTENT_CACHE_NAME)
   } catch {
     return null
@@ -179,16 +221,15 @@ async function openPersistentCache(): Promise<Cache | null> {
 
 async function persistentCacheGet(
   place: Place,
-  archiveEnd: string,
-): Promise<DailyHistory | null> {
+): Promise<CachedDailyHistory | null> {
   const cache = await openPersistentCache()
   if (!cache) return null
   try {
-    const url = persistentCacheUrl(place, archiveEnd)
+    const url = persistentCacheUrl(place)
     const res = await cache.match(url)
     if (!res || !res.ok) return null
     const parsed: unknown = await res.json()
-    if (!isValidDailyHistory(parsed, archiveEnd)) {
+    if (!isValidCachedHistory(parsed)) {
       await cache.delete(url).catch(() => {})
       return null
     }
@@ -198,38 +239,56 @@ async function persistentCacheGet(
   }
 }
 
+async function readUpdatedAt(cache: Cache, req: Request): Promise<number> {
+  try {
+    const res = await cache.match(req)
+    if (!res || !res.ok) return Number.NEGATIVE_INFINITY
+    const parsed: unknown = await res.json()
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      typeof (parsed as Record<string, unknown>).updatedAt === 'number' &&
+      Number.isFinite((parsed as Record<string, unknown>).updatedAt)
+    ) {
+      return (parsed as Record<string, unknown>).updatedAt as number
+    }
+    return Number.NEGATIVE_INFINITY
+  } catch {
+    return Number.NEGATIVE_INFINITY
+  }
+}
+
 async function persistentCacheSet(
   place: Place,
-  history: DailyHistory,
+  entry: CachedDailyHistory,
 ): Promise<void> {
   const cache = await openPersistentCache()
   if (!cache) return
   try {
-    const url = persistentCacheUrl(place, history.archiveEnd)
+    const url = persistentCacheUrl(place)
     await cache.delete(url)
     await cache.put(
       url,
-      new Response(JSON.stringify(history), {
+      new Response(JSON.stringify(entry), {
         headers: { 'Content-Type': 'application/json' },
       }),
     )
 
     const keys = await cache.keys()
-    const kept: Request[] = []
-    for (const req of keys) {
-      const entryEnd = extractArchiveEnd(req.url)
-      if (entryEnd && entryEnd < history.archiveEnd) {
-        await cache.delete(req)
-      } else {
-        kept.push(req)
-      }
-    }
+    if (keys.length <= PERSISTENT_CACHE_MAX) return
 
-    let excess = kept.length - PERSISTENT_CACHE_MAX
-    for (const req of kept) {
-      if (excess <= 0) break
+    const candidates: Array<{ req: Request; updatedAt: number }> = []
+    for (const req of keys) {
       if (req.url === url) continue
-      await cache.delete(req)
+      const updatedAt = await readUpdatedAt(cache, req)
+      candidates.push({ req, updatedAt })
+    }
+    candidates.sort((a, b) => a.updatedAt - b.updatedAt)
+
+    let excess = keys.length - PERSISTENT_CACHE_MAX
+    for (const item of candidates) {
+      if (excess <= 0) break
+      await cache.delete(item.req)
       excess -= 1
     }
   } catch {
@@ -259,10 +318,21 @@ function parseDaily(
   return days
 }
 
+function abortError(): DOMException {
+  return new DOMException('Aborted', 'AbortError')
+}
+
+function isAbortError(err: unknown): boolean {
+  return (
+    (err instanceof DOMException || err instanceof Error) &&
+    err.name === 'AbortError'
+  )
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
-      reject(new DOMException('Aborted', 'AbortError'))
+      reject(abortError())
       return
     }
     const t = globalThis.setTimeout(() => {
@@ -271,38 +341,38 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     }, ms)
     const onAbort = () => {
       globalThis.clearTimeout(t)
-      reject(new DOMException('Aborted', 'AbortError'))
+      reject(abortError())
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
 }
 
 /**
- * One full-history request (1940 → yesterday). Most polite pattern for
- * Open-Meteo free tier: minimize call count, cache, don't burst.
+ * Fetch an inclusive daily range from the Open-Meteo archive API.
+ * Retries at most once on 429 with a polite pause honoring AbortSignal.
  */
-async function fetchFullHistory(
+async function fetchRange(
   place: Place,
-  archiveEnd: string,
+  startDate: string,
+  endDate: string,
   signal?: AbortSignal,
 ): Promise<{ days: DailyObservation[]; timezone: string }> {
   const url = new URL('https://archive-api.open-meteo.com/v1/archive')
   url.searchParams.set('latitude', String(place.latitude))
   url.searchParams.set('longitude', String(place.longitude))
-  url.searchParams.set('start_date', ARCHIVE_START)
-  url.searchParams.set('end_date', archiveEnd)
+  url.searchParams.set('start_date', startDate)
+  url.searchParams.set('end_date', endDate)
   url.searchParams.set(
     'daily',
     'temperature_2m_max,temperature_2m_min,precipitation_sum',
   )
   url.searchParams.set('timezone', 'auto')
 
-  // At most one gentle retry after a long pause — never a rapid retry storm
   const maxAttempts = 2
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (signal?.aborted) {
-      throw new DOMException('Aborted', 'AbortError')
+      throw abortError()
     }
 
     const res = await fetch(url, { signal })
@@ -316,12 +386,11 @@ async function fetchFullHistory(
           'Open-Meteo rate limit (429)',
         )
       }
-      // Wait well beyond a short burst window before one polite retry
       const retryAfter = Number(res.headers.get('Retry-After'))
       const waitMs =
         Number.isFinite(retryAfter) && retryAfter > 0
-          ? Math.max(retryAfter * 1000, 15_000)
-          : 20_000
+          ? Math.max(retryAfter * 1000, minRetryDelayMs)
+          : defaultRetryDelayMs
       await sleep(waitMs, signal)
       continue
     }
@@ -359,63 +428,324 @@ async function fetchFullHistory(
   )
 }
 
+function toUpdate(
+  history: CachedDailyHistory,
+  phase: HistoryLoadPhase,
+  backgroundError: UserHistoryError | null = null,
+): DailyHistoryUpdate {
+  return {
+    days: history.days,
+    archiveEnd: history.archiveEnd,
+    timezone: history.timezone,
+    coverageStart: history.startDate,
+    isComplete: history.complete,
+    phase,
+    backgroundError,
+  }
+}
+
+function emitUpdate(entry: InflightEntry, update: DailyHistoryUpdate) {
+  if (entry.controller.signal.aborted) return
+  entry.lastUpdate = update
+  for (const listener of [...entry.listeners]) {
+    listener(update)
+  }
+}
+
 /**
- * Load full history for a place. Shared per place so remounts do not
- * double-call Open-Meteo, while aborting the shared fetch if all active
- * subscribers abort.
+ * Load weather history progressively for a place using Cache API v2,
+ * tail delta refreshes, and 2-phase cold loading (recent 20 years first).
+ * Deduplicates concurrent subscribers and replays latest emitted state.
  */
-export function fetchDailyHistory(
+export function loadDailyHistory(
   place: Place,
-  signal?: AbortSignal,
-): Promise<DailyHistory> {
+  options?: {
+    signal?: AbortSignal
+    preferredAnchor?: string | null
+    onUpdate?: (update: DailyHistoryUpdate) => void
+  },
+): Promise<DailyHistoryUpdate> {
+  const signal = options?.signal
+  const onUpdate = options?.onUpdate
+
   if (signal?.aborted) {
-    return Promise.reject(new DOMException('Aborted', 'AbortError'))
+    return Promise.reject(abortError())
   }
 
-  const archiveEnd = yesterdayUtc()
-  const key = cacheKey(place, archiveEnd)
-  const cached = cacheGet(key)
-  if (cached) {
-    return Promise.resolve({
-      days: cached.days,
-      archiveEnd: cached.endDate,
-      timezone: cached.timezone,
-    })
+  const targetEnd = getYesterdayUtc()
+  const key = locationKey(place)
+  const mem = cacheGet(key)
+  if (mem && mem.complete && compareIsoDates(mem.archiveEnd, targetEnd) >= 0) {
+    const update = toUpdate(mem, 'complete')
+    onUpdate?.(update)
+    return Promise.resolve(update)
   }
 
   let entry = inflightByKey.get(key)
   if (!entry) {
     const controller = new AbortController()
     const created: InflightEntry = {
-      promise: null as unknown as Promise<DailyHistory>,
+      promise: null as unknown as Promise<DailyHistoryUpdate>,
       controller,
       subscribers: 0,
+      listeners: new Set(),
+      lastUpdate: null,
     }
-    created.promise = (async (): Promise<DailyHistory> => {
-      const persisted = await persistentCacheGet(place, archiveEnd)
-      if (persisted) {
-        cacheSet(key, {
-          days: persisted.days,
-          endDate: persisted.archiveEnd,
-          timezone: persisted.timezone,
-        })
-        return persisted
+
+    const execute = async (): Promise<DailyHistoryUpdate> => {
+      const { signal: innerSignal } = controller
+      if (innerSignal.aborted) throw abortError()
+
+      const cached = cacheGet(key) ?? (await persistentCacheGet(place))
+      if (innerSignal.aborted) throw abortError()
+
+      const plan = planArchiveFetch({
+        cached,
+        targetEnd,
+        preferredAnchor: options?.preferredAnchor,
+      })
+
+      if (plan.kind === 'cache-hit' && cached) {
+        cacheSet(key, cached)
+        const update = toUpdate(cached, 'complete')
+        emitUpdate(created, update)
+        return update
       }
-      const { days, timezone } = await fetchFullHistory(
+
+      if (plan.kind === 'delta-only' && cached) {
+        cacheSet(key, cached)
+        emitUpdate(created, toUpdate(cached, 'refreshing'))
+        try {
+          const delta = await fetchRange(
+            place,
+            plan.deltaStart,
+            plan.deltaEnd,
+            innerSignal,
+          )
+          const updated: CachedDailyHistory = {
+            version: 2,
+            startDate: cached.startDate,
+            archiveEnd: plan.deltaEnd,
+            complete: true,
+            timezone: delta.timezone || cached.timezone,
+            updatedAt: getNow(),
+            days: mergeDailyObservations(cached.days, delta.days),
+          }
+          cacheSet(key, updated)
+          await persistentCacheSet(place, updated)
+          const update = toUpdate(updated, 'complete')
+          emitUpdate(created, update)
+          return update
+        } catch (err) {
+          if (innerSignal.aborted || isAbortError(err)) throw err
+          const update = toUpdate(
+            cached,
+            'complete',
+            toUserHistoryError(err),
+          )
+          emitUpdate(created, update)
+          return update
+        }
+      }
+
+      if (plan.kind === 'backfill-only' && cached) {
+        cacheSet(key, cached)
+        emitUpdate(created, toUpdate(cached, 'backfilling'))
+        try {
+          const older = await fetchRange(
+            place,
+            plan.backfillStart,
+            plan.backfillEnd,
+            innerSignal,
+          )
+          const updated: CachedDailyHistory = {
+            version: 2,
+            startDate: ARCHIVE_START,
+            archiveEnd: cached.archiveEnd,
+            complete: true,
+            timezone: cached.timezone || older.timezone,
+            updatedAt: getNow(),
+            days: mergeDailyObservations(older.days, cached.days),
+          }
+          cacheSet(key, updated)
+          await persistentCacheSet(place, updated)
+          const update = toUpdate(updated, 'complete')
+          emitUpdate(created, update)
+          return update
+        } catch (err) {
+          if (innerSignal.aborted || isAbortError(err)) throw err
+          const update = toUpdate(
+            cached,
+            'complete',
+            toUserHistoryError(err),
+          )
+          emitUpdate(created, update)
+          return update
+        }
+      }
+
+      if (plan.kind === 'backfill-and-delta' && cached) {
+        cacheSet(key, cached)
+        emitUpdate(created, toUpdate(cached, 'backfilling'))
+
+        let current = cached
+        try {
+          const delta = await fetchRange(
+            place,
+            plan.deltaStart,
+            plan.deltaEnd,
+            innerSignal,
+          )
+          current = {
+            version: 2,
+            startDate: current.startDate,
+            archiveEnd: plan.deltaEnd,
+            complete: false,
+            timezone: delta.timezone || current.timezone,
+            updatedAt: getNow(),
+            days: mergeDailyObservations(current.days, delta.days),
+          }
+          cacheSet(key, current)
+          await persistentCacheSet(place, current)
+          emitUpdate(created, toUpdate(current, 'backfilling'))
+        } catch (err) {
+          if (innerSignal.aborted || isAbortError(err)) throw err
+          const update = toUpdate(
+            current,
+            'complete',
+            toUserHistoryError(err),
+          )
+          emitUpdate(created, update)
+          return update
+        }
+
+        if (innerSignal.aborted) throw abortError()
+
+        try {
+          const older = await fetchRange(
+            place,
+            plan.backfillStart,
+            plan.backfillEnd,
+            innerSignal,
+          )
+          current = {
+            version: 2,
+            startDate: ARCHIVE_START,
+            archiveEnd: current.archiveEnd,
+            complete: true,
+            timezone: current.timezone || older.timezone,
+            updatedAt: getNow(),
+            days: mergeDailyObservations(older.days, current.days),
+          }
+          cacheSet(key, current)
+          await persistentCacheSet(place, current)
+          const update = toUpdate(current, 'complete')
+          emitUpdate(created, update)
+          return update
+        } catch (err) {
+          if (innerSignal.aborted || isAbortError(err)) throw err
+          const update = toUpdate(
+            current,
+            'complete',
+            toUserHistoryError(err),
+          )
+          emitUpdate(created, update)
+          return update
+        }
+      }
+
+      if (plan.kind === 'cold-full') {
+        const fetched = await fetchRange(
+          place,
+          plan.start,
+          plan.end,
+          innerSignal,
+        )
+        const completeHistory: CachedDailyHistory = {
+          version: 2,
+          startDate: ARCHIVE_START,
+          archiveEnd: plan.end,
+          complete: true,
+          timezone: fetched.timezone,
+          updatedAt: getNow(),
+          days: fetched.days,
+        }
+        cacheSet(key, completeHistory)
+        await persistentCacheSet(place, completeHistory)
+        const update = toUpdate(completeHistory, 'complete')
+        emitUpdate(created, update)
+        return update
+      }
+
+      if (plan.kind !== 'cold-two-phase') {
+        throw new WeatherArchiveError(
+          'unknown',
+          'Could not load weather history',
+          'Something went wrong while planning the weather archive request.',
+          `Unexpected archive fetch plan: ${plan.kind}`,
+        )
+      }
+
+      const phase1 = await fetchRange(
         place,
-        archiveEnd,
-        controller.signal,
+        plan.recentStart,
+        plan.recentEnd,
+        innerSignal,
       )
-      const history: DailyHistory = { days, archiveEnd, timezone }
-      cacheSet(key, { days, endDate: archiveEnd, timezone })
-      await persistentCacheSet(place, history)
-      return history
-    })()
-      .then((history) => {
+      const partial: CachedDailyHistory = {
+        version: 2,
+        startDate: plan.recentStart,
+        archiveEnd: plan.recentEnd,
+        complete: false,
+        timezone: phase1.timezone,
+        updatedAt: getNow(),
+        days: phase1.days,
+      }
+      cacheSet(key, partial)
+      await persistentCacheSet(place, partial)
+      emitUpdate(created, toUpdate(partial, 'backfilling'))
+
+      if (innerSignal.aborted) throw abortError()
+
+      try {
+        const phase2 = await fetchRange(
+          place,
+          plan.backfillStart,
+          plan.backfillEnd,
+          innerSignal,
+        )
+        const completeHistory: CachedDailyHistory = {
+          version: 2,
+          startDate: ARCHIVE_START,
+          archiveEnd: partial.archiveEnd,
+          complete: true,
+          timezone: partial.timezone || phase2.timezone,
+          updatedAt: getNow(),
+          days: mergeDailyObservations(phase2.days, partial.days),
+        }
+        cacheSet(key, completeHistory)
+        await persistentCacheSet(place, completeHistory)
+        const update = toUpdate(completeHistory, 'complete')
+        emitUpdate(created, update)
+        return update
+      } catch (err) {
+        if (innerSignal.aborted || isAbortError(err)) throw err
+        const update = toUpdate(
+          partial,
+          'complete',
+          toUserHistoryError(err),
+        )
+        emitUpdate(created, update)
+        return update
+      }
+    }
+
+    created.promise = execute()
+      .then((update) => {
         if (inflightByKey.get(key) === created) {
           inflightByKey.delete(key)
         }
-        return history
+        return update
       })
       .catch((err) => {
         if (inflightByKey.get(key) === created) {
@@ -423,6 +753,7 @@ export function fetchDailyHistory(
         }
         throw err
       })
+
     entry = created
     created.promise.catch(() => {})
     inflightByKey.set(key, entry)
@@ -430,12 +761,21 @@ export function fetchDailyHistory(
 
   const activeEntry = entry
   activeEntry.subscribers += 1
+  if (onUpdate) {
+    activeEntry.listeners.add(onUpdate)
+    if (activeEntry.lastUpdate) {
+      onUpdate(activeEntry.lastUpdate)
+    }
+  }
 
-  return new Promise<DailyHistory>((resolve, reject) => {
+  return new Promise<DailyHistoryUpdate>((resolve, reject) => {
     let settled = false
 
     const cleanup = () => {
       signal?.removeEventListener('abort', onAbort)
+      if (onUpdate) {
+        activeEntry.listeners.delete(onUpdate)
+      }
     }
 
     const onAbort = () => {
@@ -449,7 +789,7 @@ export function fetchDailyHistory(
         }
         activeEntry.controller.abort()
       }
-      reject(new DOMException('Aborted', 'AbortError'))
+      reject(abortError())
     }
 
     if (signal?.aborted) {
@@ -460,12 +800,12 @@ export function fetchDailyHistory(
     signal?.addEventListener('abort', onAbort, { once: true })
 
     activeEntry.promise.then(
-      (history) => {
+      (update) => {
         if (settled) return
         settled = true
         cleanup()
         activeEntry.subscribers -= 1
-        resolve(history)
+        resolve(update)
       },
       (err) => {
         if (settled) return
@@ -482,11 +822,7 @@ export function isRateLimitError(e: unknown): e is WeatherArchiveError {
   return e instanceof WeatherArchiveError && e.kind === 'rate_limit'
 }
 
-export function toUserHistoryError(e: unknown): {
-  title: string
-  detail: string
-  kind: WeatherArchiveError['kind'] | 'unknown'
-} {
+export function toUserHistoryError(e: unknown): UserHistoryError {
   if (e instanceof WeatherArchiveError) {
     return { title: e.title, detail: e.detail, kind: e.kind }
   }
