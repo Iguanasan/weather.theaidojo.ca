@@ -43,3 +43,7 @@ Product definition: [PRODUCT.md](./PRODUCT.md)
 - Recharts  
 - Open-Meteo Archive + Geocoding APIs  
 - Cloudflare Workers (static assets + Wrangler)  
+
+## Location & Privacy
+
+When using **Use my location**, browser coordinates are rounded to ~1 km (2 decimal places) before being sent to BigDataCloud for reverse geocoding and to Open-Meteo for historical weather data. Fonts are self-hosted, so no third-party font requests are made.

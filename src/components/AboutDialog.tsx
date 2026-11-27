@@ -115,6 +115,14 @@ export function AboutDialog({ open, onClose }: Props) {
             licence.
           </p>
           <hr className="about-rule" />
+          <h3 className="about-section-title">Location &amp; Privacy</h3>
+          <p className="muted">
+            When using &ldquo;Use my location&rdquo;, browser coordinates are
+            rounded to ~1&nbsp;km (2&nbsp;decimal places) before being sent to
+            BigDataCloud for reverse geocoding and to Open-Meteo for weather
+            history. No third-party font requests are made.
+          </p>
+          <hr className="about-rule" />
           <h3 className="about-section-title">Disclaimer</h3>
           <p className="muted about-disclaimer">
             Weather data is provided as-is without warranty. Analog matches are

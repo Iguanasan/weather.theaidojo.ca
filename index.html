@@ -11,6 +11,7 @@
       name="description"
       content="When did it feel like this? Find past weather spells like this day, week, or month from the historical record."
     />
+    <meta name="referrer" content="no-referrer" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -18,24 +19,7 @@
       rel="stylesheet"
     />
     <title>When did it feel like?</title>
-    <script>
-      (function () {
-        try {
-          var stored = localStorage.getItem('theme')
-          var theme =
-            stored === 'light' || stored === 'dark'
-              ? stored
-              : window.matchMedia('(prefers-color-scheme: dark)').matches
-                ? 'dark'
-                : 'light'
-          document.documentElement.setAttribute('data-theme', theme)
-          document.documentElement.style.colorScheme = theme
-        } catch (e) {
-          document.documentElement.setAttribute('data-theme', 'light')
-          document.documentElement.style.colorScheme = 'light'
-        }
-      })()
-    </script>
+    <script src="/theme-boot.js"></script>
   </head>
   <body>
     <div id="root"></div>
