@@ -2,6 +2,8 @@ export type LoadStage = 'locating' | 'history' | 'searching'
 
 type Props = {
   stage: LoadStage
+  /** Optional custom heading override */
+  title?: string
   /** Optional place label for context */
   placeLabel?: string | null
   /**
@@ -123,12 +125,14 @@ function fillClassFor(stage: LoadStage, progress?: number): string {
  */
 export function LoadingWeather({
   stage,
+  title,
   placeLabel,
   variant = 'overlay',
   progress,
   detail,
 }: Props) {
   const copy = COPY[stage]
+  const heading = title || copy.title
   const fillClass = fillClassFor(stage, progress)
   const pct =
     typeof progress === 'number' && Number.isFinite(progress)
@@ -142,11 +146,11 @@ export function LoadingWeather({
         role="status"
         aria-live="polite"
         aria-busy="true"
-        aria-label={detail || copy.title}
+        aria-label={detail || heading}
       >
         <Scene fillClass={fillClass} compact />
         <div className="loading-banner-copy">
-          <strong className="loading-banner-title">{copy.title}</strong>
+          <strong className="loading-banner-title">{heading}</strong>
           <span className="muted loading-banner-detail">
             {detail || copy.line}
             {pct != null ? ` · ${pct}%` : ''}
@@ -165,13 +169,13 @@ export function LoadingWeather({
       role="status"
       aria-live="polite"
       aria-busy="true"
-      aria-label={copy.title}
+      aria-label={heading}
     >
       <div className="loading-weather-card">
         <div className="loading-scene">
           <Scene fillClass={fillClass} />
         </div>
-        <h2 className="loading-title">{copy.title}</h2>
+        <h2 className="loading-title">{heading}</h2>
         <p className="loading-line muted">{detail || copy.line}</p>
         {placeLabel ? (
           <p className="loading-place muted">{placeLabel}</p>

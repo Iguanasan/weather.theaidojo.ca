@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ARCHIVE_START,
   OPEN_METEO_TERMS_URL,
-  fetchDailyHistory,
+  loadDailyHistory,
   toUserHistoryError,
+  type HistoryLoadPhase,
+  type UserHistoryError,
 } from './api/archive'
 import { detectCurrentPlace, formatPlaceLabel } from './api/geocode'
 import { AboutDialog } from './components/AboutDialog'
@@ -49,13 +51,11 @@ export default function App() {
 
   const [days, setDays] = useState<DailyObservation[] | null>(null)
   const [archiveEnd, setArchiveEnd] = useState<string | null>(null)
-  /** True while fetching the full history archive for the selected place. */
-  const [loadingHistory, setLoadingHistory] = useState(false)
-  const [historyError, setHistoryError] = useState<{
-    title: string
-    detail: string
-    kind: string
-  } | null>(null)
+  const [coverageStart, setCoverageStart] = useState<string | null>(null)
+  /** Progressive history loading phase for the selected place. */
+  const [historyPhase, setHistoryPhase] = useState<HistoryLoadPhase | null>(null)
+  const [historyError, setHistoryError] = useState<UserHistoryError | null>(null)
+  const [backgroundError, setBackgroundError] = useState<UserHistoryError | null>(null)
   /** Bump to retry archive load for the same place after an error. */
   const [historyReloadKey, setHistoryReloadKey] = useState(0)
   const [locating, setLocating] = useState(!hadPlaceInUrl)
@@ -68,8 +68,11 @@ export default function App() {
   const [aboutOpen, setAboutOpen] = useState(false)
 
   const abortRef = useRef<AbortController | null>(null)
+  const loadedPlaceKeyRef = useRef<string | null>(null)
+  const hasDaysRef = useRef(false)
   const liveModeRef = useRef(liveMode)
   const anchorDateRef = useRef(anchorDate)
+  hasDaysRef.current = Boolean(days)
   liveModeRef.current = liveMode
   anchorDateRef.current = anchorDate
 
@@ -135,41 +138,68 @@ export default function App() {
     }
   }, [hadPlaceInUrl])
 
-  // Fetch full history once per place; analog matching runs after state settles.
+  // Load history progressively per place; analog matching runs as data arrives.
   useEffect(() => {
     if (!place) {
+      loadedPlaceKeyRef.current = null
       setDays(null)
       setArchiveEnd(null)
+      setCoverageStart(null)
       setAnalogs([])
       setSelected(null)
-      setLoadingHistory(false)
+      setHistoryPhase(null)
+      setHistoryError(null)
+      setBackgroundError(null)
       return
     }
+
+    const nextPlaceKey = `${place.latitude.toFixed(2)},${place.longitude.toFixed(2)}`
+    const isNewPlace = loadedPlaceKeyRef.current !== nextPlaceKey
+    loadedPlaceKeyRef.current = nextPlaceKey
 
     abortRef.current?.abort()
     const ac = new AbortController()
     abortRef.current = ac
-    setLoadingHistory(true)
     setHistoryError(null)
-    setDays(null)
-    setAnalogs([])
-    setSelected(null)
+    setBackgroundError(null)
+    if (isNewPlace) {
+      setHistoryPhase('loading')
+      setDays(null)
+      setArchiveEnd(null)
+      setCoverageStart(null)
+      setAnalogs([])
+      setSelected(null)
+    } else if (!hasDaysRef.current) {
+      setHistoryPhase('loading')
+    }
 
     ;(async () => {
       try {
-        const history = await fetchDailyHistory(place, ac.signal)
-        if (ac.signal.aborted) return
-
-        setDays(history.days)
-        setArchiveEnd(history.archiveEnd)
-        setLoadingHistory(false)
-        if (liveModeRef.current || !anchorDateRef.current) {
-          setAnchorDate(history.archiveEnd)
-        }
+        await loadDailyHistory(place, {
+          signal: ac.signal,
+          preferredAnchor: liveModeRef.current ? null : anchorDateRef.current,
+          onUpdate: (update) => {
+            if (ac.signal.aborted) return
+            setDays(update.days)
+            setArchiveEnd(update.archiveEnd)
+            setCoverageStart(update.coverageStart)
+            setHistoryPhase(update.phase)
+            setBackgroundError(update.backgroundError ?? null)
+            if (liveModeRef.current || !anchorDateRef.current) {
+              setAnchorDate(update.archiveEnd)
+            }
+          },
+        })
       } catch (e) {
-        if ((e as Error).name === 'AbortError') return
+        if (
+          ac.signal.aborted ||
+          ((e instanceof DOMException || e instanceof Error) &&
+            e.name === 'AbortError')
+        ) {
+          return
+        }
         setHistoryError(toUserHistoryError(e))
-        setLoadingHistory(false)
+        setHistoryPhase(null)
       }
     })()
 
@@ -482,14 +512,68 @@ export default function App() {
 
       {place && (
         <>
-          {loadingHistory && !historyError && (
+          {!days && historyPhase === 'loading' && !historyError && (
             <LoadingWeather
               stage="history"
               variant="banner"
               progress={0.15}
-              detail="Collecting historical weather from the open archive… this can take a moment."
+              detail="Collecting recent weather from the open archive… this can take a moment."
               placeLabel={formatPlaceLabel(place)}
             />
+          )}
+
+          {days && historyPhase === 'backfilling' && !historyError && (
+            <LoadingWeather
+              stage="history"
+              variant="banner"
+              title="Expanding historical archive…"
+              progress={0.55}
+              detail={`Showing ${formatNiceDate(
+                coverageStart ?? days[0]?.date ?? ARCHIVE_START,
+              )}–${formatNiceDate(
+                archiveEnd ?? days[days.length - 1]!.date,
+              )} · loading earlier archive back to 1940…`}
+              placeLabel={formatPlaceLabel(place)}
+            />
+          )}
+
+          {days && backgroundError && !historyError && (
+            <section
+              className={`panel background-error-banner${
+                backgroundError.kind === 'rate_limit'
+                  ? ' background-error-banner--rate'
+                  : ''
+              }`}
+              role="status"
+            >
+              <div className="background-error-copy">
+                <strong>{backgroundError.title}</strong>
+                <p className="muted">
+                  Showing {formatNiceDate(coverageStart ?? days[0]?.date ?? ARCHIVE_START)}–
+                  {formatNiceDate(archiveEnd ?? days[days.length - 1]!.date)}.{' '}
+                  {backgroundError.detail}
+                </p>
+              </div>
+              <div className="background-error-actions">
+                <button
+                  type="button"
+                  className="secondary-btn background-error-btn"
+                  onClick={() => {
+                    setBackgroundError(null)
+                    setHistoryReloadKey((k) => k + 1)
+                  }}
+                >
+                  Try again
+                </button>
+                <button
+                  type="button"
+                  className="secondary-btn background-error-btn"
+                  onClick={() => setBackgroundError(null)}
+                >
+                  Dismiss
+                </button>
+              </div>
+            </section>
           )}
 
           {historyError && (
@@ -540,7 +624,7 @@ export default function App() {
                 <span className="muted status-archive">
                   {' '}
                   - (
-                  {formatNiceDate(days?.[0]?.date ?? ARCHIVE_START)}
+                  {formatNiceDate(coverageStart ?? days?.[0]?.date ?? ARCHIVE_START)}
                   {' to '}
                   {formatNiceDate(archiveEnd)}
                   ) - All available data from{' '}
@@ -554,10 +638,22 @@ export default function App() {
                   .
                 </span>
               )}
-              {loadingHistory && !historyError && (
+              {!days && historyPhase === 'loading' && !historyError && (
                 <span className="muted">
                   {' '}
                   Loading the historical record…
+                </span>
+              )}
+              {days && historyPhase === 'refreshing' && !historyError && (
+                <span className="muted status-sync">
+                  {' '}
+                  Checking for latest days…
+                </span>
+              )}
+              {days && historyPhase === 'backfilling' && !historyError && (
+                <span className="muted status-sync">
+                  {' '}
+                  Loading earlier archive back to 1940…
                 </span>
               )}
             </div>
@@ -684,7 +780,19 @@ export default function App() {
           )}
 
           {place &&
-            !loadingHistory &&
+            !focal &&
+            !historyError &&
+            days &&
+            (historyPhase === 'backfilling' || historyPhase === 'refreshing') && (
+              <section className="panel">
+                <p className="muted">Loading older historical records…</p>
+              </section>
+            )}
+
+          {place &&
+            historyPhase !== 'loading' &&
+            historyPhase !== 'backfilling' &&
+            historyPhase !== 'refreshing' &&
             !focal &&
             !historyError &&
             days && (
