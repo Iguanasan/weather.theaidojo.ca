@@ -75,6 +75,8 @@ export function AboutDialog({ open, onClose }: Props) {
               alt=""
               width={96}
               height={96}
+              loading="lazy"
+              decoding="async"
             />
             <div>
               <p className="about-dev-name">Glenn Euloth</p>
