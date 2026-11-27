@@ -86,7 +86,7 @@ export async function reverseGeocode(
   const admin1 = data.principalSubdivision?.trim() || undefined
 
   return {
-    id: `geo:${latitude.toFixed(4)},${longitude.toFixed(4)}`,
+    id: `geo:${latitude.toFixed(2)},${longitude.toFixed(2)}`,
     name,
     admin1,
     country,
@@ -98,13 +98,18 @@ export async function reverseGeocode(
 
 function placeFromCoords(latitude: number, longitude: number): Place {
   return {
-    id: `geo:${latitude.toFixed(4)},${longitude.toFixed(4)}`,
+    id: `geo:${latitude.toFixed(2)},${longitude.toFixed(2)}`,
     name: 'Your location',
     country: 'Unknown',
     countryCode: 'XX',
     latitude,
     longitude,
   }
+}
+
+function roundCoord(v: number): number {
+  const r = Math.round(v * 100) / 100
+  return r === 0 ? 0 : r
 }
 
 function getPositionOnce(options: PositionOptions): Promise<GeolocationPosition> {
@@ -201,16 +206,14 @@ async function runDetectCurrentPlace(options?: {
     }
     try {
       const pos = await getPositionOnce(attempts[i]!)
+      const latitude = roundCoord(pos.coords.latitude)
+      const longitude = roundCoord(pos.coords.longitude)
       try {
-        return await reverseGeocode(
-          pos.coords.latitude,
-          pos.coords.longitude,
-          signal,
-        )
+        return await reverseGeocode(latitude, longitude, signal)
       } catch (e) {
         if ((e as Error).name === 'AbortError') throw e
         // Coords alone are enough for weather if reverse geocode fails.
-        return placeFromCoords(pos.coords.latitude, pos.coords.longitude)
+        return placeFromCoords(latitude, longitude)
       }
     } catch (e) {
       if ((e as Error).name === 'AbortError') throw e
