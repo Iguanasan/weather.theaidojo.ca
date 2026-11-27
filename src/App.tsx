@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ARCHIVE_START,
   OPEN_METEO_TERMS_URL,
-  streamDailyHistory,
+  fetchDailyHistory,
   toUserHistoryError,
 } from './api/archive'
 import { detectCurrentPlace, formatPlaceLabel } from './api/geocode'
@@ -13,12 +13,7 @@ import { OverlayCharts } from './components/OverlayCharts'
 import { PlaceSearch } from './components/PlaceSearch'
 import { ThemeToggle } from './components/ThemeToggle'
 import { WeatherBackground } from './components/WeatherBackground'
-import {
-  findAnalogEpisodes,
-  findAnalogEpisodesInSlice,
-  mergeAnalogEpisodes,
-  seriesStats,
-} from './domain/analogSearch'
+import { findAnalogEpisodes, seriesStats } from './domain/analogSearch'
 import { classifyAtmosphere, getAtmosphereMeta } from './domain/atmosphere'
 import type {
   AnalogEpisode,
@@ -44,12 +39,6 @@ const TOP_N = 24
 
 type AnalogSort = 'date' | 'match'
 
-type StreamStatus = {
-  progress: number
-  label: string
-  done: boolean
-}
-
 export default function App() {
   const initial = useMemo(() => readQueryFromUrl(), [])
   const hadPlaceInUrl = Boolean(initial.placeHint)
@@ -60,10 +49,8 @@ export default function App() {
 
   const [days, setDays] = useState<DailyObservation[] | null>(null)
   const [archiveEnd, setArchiveEnd] = useState<string | null>(null)
-  /** True until the first history chunk arrives (or fails). */
-  const [awaitingFirstChunk, setAwaitingFirstChunk] = useState(false)
-  /** Background archive stream after first paint. */
-  const [streamStatus, setStreamStatus] = useState<StreamStatus | null>(null)
+  /** True while fetching the full history archive for the selected place. */
+  const [loadingHistory, setLoadingHistory] = useState(false)
   const [historyError, setHistoryError] = useState<{
     title: string
     detail: string
@@ -83,12 +70,8 @@ export default function App() {
   const abortRef = useRef<AbortController | null>(null)
   const liveModeRef = useRef(liveMode)
   const anchorDateRef = useRef(anchorDate)
-  const lengthRef = useRef(length)
-  const daysRef = useRef(days)
   liveModeRef.current = liveMode
   anchorDateRef.current = anchorDate
-  lengthRef.current = length
-  daysRef.current = days
 
   const effectiveAnchor = liveMode ? archiveEnd : anchorDate
   const units = unitsForPlace(place)
@@ -152,90 +135,41 @@ export default function App() {
     }
   }, [hadPlaceInUrl])
 
-  // Progressive history: recent years first, older decades in the background.
-  // Score only each new chunk (merge) so we never re-scan all decades on the
-  // main thread after every network response — that froze the UI.
+  // Fetch full history once per place; analog matching runs after state settles.
   useEffect(() => {
     if (!place) {
       setDays(null)
       setArchiveEnd(null)
       setAnalogs([])
       setSelected(null)
-      setStreamStatus(null)
-      setAwaitingFirstChunk(false)
+      setLoadingHistory(false)
       return
     }
 
     abortRef.current?.abort()
     const ac = new AbortController()
     abortRef.current = ac
-    setAwaitingFirstChunk(true)
+    setLoadingHistory(true)
     setHistoryError(null)
     setDays(null)
     setAnalogs([])
     setSelected(null)
-    setStreamStatus({ progress: 0, label: 'historical record', done: false })
-
-    let first = true
 
     ;(async () => {
       try {
-        for await (const update of streamDailyHistory(place, ac.signal)) {
-          if (ac.signal.aborted) return
+        const history = await fetchDailyHistory(place, ac.signal)
+        if (ac.signal.aborted) return
 
-          setDays(update.days)
-          setArchiveEnd(update.archiveEnd)
-          setStreamStatus({
-            progress: update.progress,
-            label: update.label,
-            done: update.done,
-          })
-
-          if (first) {
-            first = false
-            setAwaitingFirstChunk(false)
-            if (liveModeRef.current || !anchorDateRef.current) {
-              setAnchorDate(update.archiveEnd)
-            }
-          }
-
-          // Resolve anchor for this paint (live → archive end)
-          const anchor = liveModeRef.current
-            ? update.archiveEnd
-            : (anchorDateRef.current ?? update.archiveEnd)
-          const L = lengthRef.current
-          const focalNow = buildFocalFromHistory(update.days, anchor, L)
-
-          if (focalNow && update.newDays.length > 0) {
-            const found = findAnalogEpisodesInSlice(
-              update.newDays,
-              focalNow.series,
-              {
-                length: L,
-                focalStart: focalNow.start,
-                focalEnd: focalNow.end,
-                topN: TOP_N,
-              },
-            )
-            if (found.length) {
-              setAnalogs((prev) => mergeAnalogEpisodes(prev, found, TOP_N))
-            }
-          }
-
-          if (update.done) {
-            setStreamStatus(null)
-          }
-
-          // Let the browser paint between updates
-          await new Promise<void>((r) => {
-            window.setTimeout(r, 0)
-          })
+        setDays(history.days)
+        setArchiveEnd(history.archiveEnd)
+        setLoadingHistory(false)
+        if (liveModeRef.current || !anchorDateRef.current) {
+          setAnchorDate(history.archiveEnd)
         }
       } catch (e) {
         if ((e as Error).name === 'AbortError') return
         setHistoryError(toUserHistoryError(e))
-        setAwaitingFirstChunk(false)
-        setStreamStatus(null)
+        setLoadingHistory(false)
       }
     })()
 
@@ -256,33 +190,21 @@ export default function App() {
     document.documentElement.setAttribute('data-atmosphere', atmosphere)
   }, [atmosphere])
 
-  // Full re-scan only when the user changes window or anchor — not when
-  // progressive chunks arrive (those merge in the stream loop above).
+  // Run analog matching once whenever (days, effectiveAnchor, length) settles.
   useEffect(() => {
-    const d = daysRef.current
-    if (!d || !effectiveAnchor) {
-      // Place/stream owns clearing while loading; don't wipe mid-stream merges
-      // when anchor is briefly unset.
-      if (!d) {
-        setAnalogs([])
-        setSelected(null)
-      }
-      return
-    }
-    const f = buildFocalFromHistory(d, effectiveAnchor, length)
-    if (!f) {
+    if (!days || !focal) {
       setAnalogs([])
       setSelected(null)
       return
     }
-    const results = findAnalogEpisodes(d, f.series, {
+    const results = findAnalogEpisodes(days, focal.series, {
       length,
-      focalStart: f.start,
-      focalEnd: f.end,
+      focalStart: focal.start,
+      focalEnd: focal.end,
       topN: TOP_N,
     })
     setAnalogs(results)
-  }, [length, effectiveAnchor])
+  }, [days, focal, length])
 
   const sortedAnalogs = useMemo(() => {
     if (analogSort === 'date') return analogs
@@ -334,7 +256,6 @@ export default function App() {
   }
 
   const focalStats = focal ? seriesStats(focal.series) : null
-  const streaming = Boolean(streamStatus && !streamStatus.done)
 
   async function copyShareLink() {
     const url = shareableUrl(query)
@@ -561,11 +482,11 @@ export default function App() {
 
       {place && (
         <>
-          {(awaitingFirstChunk || streaming) && !historyError && (
+          {loadingHistory && !historyError && (
             <LoadingWeather
               stage="history"
               variant="banner"
-              progress={streamStatus?.progress ?? 0.15}
+              progress={0.15}
               detail="Collecting historical weather from the open archive… this can take a moment."
               placeLabel={formatPlaceLabel(place)}
             />
@@ -633,7 +554,7 @@ export default function App() {
                   .
                 </span>
               )}
-              {streaming && (
+              {loadingHistory && !historyError && (
                 <span className="muted">
                   {' '}
                   Loading the historical record…
@@ -732,9 +653,6 @@ export default function App() {
                     : 'Strongest match first'}{' '}
                   · one spell per year · only if close enough (score ≥ 50). +/−
                   is warmer/cooler or wetter/drier than this spell.
-                  {streaming
-                    ? ' Older years keep arriving in the background.'
-                    : ''}
                 </p>
                 <AnalogList
                   analogs={sortedAnalogs}
@@ -766,15 +684,13 @@ export default function App() {
           )}
 
           {place &&
-            !awaitingFirstChunk &&
+            !loadingHistory &&
             !focal &&
             !historyError &&
             days && (
             <section className="panel">
               <p className="error-text">
-                {streaming
-                  ? 'Still loading older years for this date…'
-                  : 'Not enough complete daily data for this window ending on the selected date. Try a later anchor or a shorter window.'}
+                Not enough complete daily data for this window ending on the selected date. Try a later anchor or a shorter window.
               </p>
             </section>
           )}

@@ -32,20 +32,19 @@ const historyCache = new Map<
 >()
 
 /** Dedupe concurrent loads (React Strict Mode, rapid re-select). */
-const inflightByKey = new Map<string, Promise<HistoryStreamUpdate>>()
+type InflightEntry = {
+  promise: Promise<DailyHistory>
+  controller: AbortController
+  subscribers: number
+}
 
-export type HistoryStreamUpdate = {
-  /** Cumulative days loaded so far, chronological (oldest → newest). */
+const inflightByKey = new Map<string, InflightEntry>()
+
+export type DailyHistory = {
+  /** Complete daily observations loaded, chronological (oldest → newest). */
   days: DailyObservation[]
-  /** Days added in this update only. */
-  newDays: DailyObservation[]
   archiveEnd: string
   timezone: string
-  chunkStart: string
-  chunkEnd: string
-  progress: number
-  done: boolean
-  label: string
 }
 
 /** Friendly, non-technical errors for the UI. */
@@ -136,7 +135,6 @@ function parseDaily(
       tMax: tMax?.[i] ?? null,
       tMin: tMin?.[i] ?? null,
       precip: precip?.[i] ?? null,
-      tMean: null,
     }
   }
   return days
@@ -243,78 +241,104 @@ async function fetchFullHistory(
 }
 
 /**
- * Load full history for a place. Yields one completed update (or cache hit).
- * Shared per place so remounts do not double-call Open-Meteo.
+ * Load full history for a place. Shared per place so remounts do not
+ * double-call Open-Meteo, while aborting the shared fetch if all active
+ * subscribers abort.
  */
-export async function* streamDailyHistory(
+export function fetchDailyHistory(
   place: Place,
   signal?: AbortSignal,
-): AsyncGenerator<HistoryStreamUpdate> {
+): Promise<DailyHistory> {
+  if (signal?.aborted) {
+    return Promise.reject(new DOMException('Aborted', 'AbortError'))
+  }
+
   const archiveEnd = yesterdayUtc()
   const key = cacheKey(place, archiveEnd)
   const cached = cacheGet(key)
   if (cached) {
-    yield {
+    return Promise.resolve({
       days: cached.days,
-      newDays: cached.days,
       archiveEnd: cached.endDate,
       timezone: cached.timezone,
-      chunkStart: cached.days[0]?.date ?? ARCHIVE_START,
-      chunkEnd: cached.endDate,
-      progress: 1,
-      done: true,
-      label: 'cached',
-    }
-    return
+    })
   }
 
-  let pending = inflightByKey.get(key)
-  if (!pending) {
-    pending = fetchFullHistory(place, archiveEnd)
+  let entry = inflightByKey.get(key)
+  if (!entry) {
+    const controller = new AbortController()
+    const created: InflightEntry = {
+      promise: null as unknown as Promise<DailyHistory>,
+      controller,
+      subscribers: 0,
+    }
+    created.promise = fetchFullHistory(place, archiveEnd, controller.signal)
       .then(({ days, timezone }) => {
         cacheSet(key, { days, endDate: archiveEnd, timezone })
-        const update: HistoryStreamUpdate = {
-          days,
-          newDays: days,
-          archiveEnd,
-          timezone,
-          chunkStart: days[0]?.date ?? ARCHIVE_START,
-          chunkEnd: archiveEnd,
-          progress: 1,
-          done: true,
-          label: `${ARCHIVE_START_YEAR}–${archiveEnd.slice(0, 4)}`,
+        if (inflightByKey.get(key) === created) {
+          inflightByKey.delete(key)
         }
-        return update
+        return { days, archiveEnd, timezone }
       })
-      .finally(() => {
-        inflightByKey.delete(key)
+      .catch((err) => {
+        if (inflightByKey.get(key) === created) {
+          inflightByKey.delete(key)
+        }
+        throw err
       })
-    inflightByKey.set(key, pending)
+    entry = created
+    created.promise.catch(() => {})
+    inflightByKey.set(key, entry)
   }
 
-  // If this subscriber aborts, others may still need the result
-  const update = await new Promise<HistoryStreamUpdate>((resolve, reject) => {
+  const activeEntry = entry
+  activeEntry.subscribers += 1
+
+  return new Promise<DailyHistory>((resolve, reject) => {
+    let settled = false
+
+    const cleanup = () => {
+      signal?.removeEventListener('abort', onAbort)
+    }
+
     const onAbort = () => {
+      if (settled) return
+      settled = true
+      cleanup()
+      activeEntry.subscribers -= 1
+      if (activeEntry.subscribers <= 0) {
+        if (inflightByKey.get(key) === activeEntry) {
+          inflightByKey.delete(key)
+        }
+        activeEntry.controller.abort()
+      }
       reject(new DOMException('Aborted', 'AbortError'))
     }
+
     if (signal?.aborted) {
       onAbort()
       return
     }
+
     signal?.addEventListener('abort', onAbort, { once: true })
-    pending!.then(
-      (u) => {
-        signal?.removeEventListener('abort', onAbort)
-        resolve(u)
+
+    activeEntry.promise.then(
+      (history) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        activeEntry.subscribers -= 1
+        resolve(history)
       },
-      (e) => {
-        signal?.removeEventListener('abort', onAbort)
-        reject(e)
+      (err) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        activeEntry.subscribers -= 1
+        reject(err)
       },
     )
   })
-
-  yield update
 }
 
 export function isRateLimitError(e: unknown): e is WeatherArchiveError {
