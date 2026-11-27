@@ -10,22 +10,39 @@ import {
 } from './archive'
 
 class MockCache {
-  private readonly store = new Map<string, string>()
+  private readonly store = new Map<
+    string,
+    { body: string; headers: Array<[string, string]> }
+  >()
+  readonly jsonReadUrls: string[] = []
 
   async match(request: RequestInfo | URL): Promise<Response | undefined> {
     const key = typeof request === 'string' ? request : request instanceof URL ? request.toString() : request.url
-    const body = this.store.get(key)
-    if (body === undefined) return undefined
-    return new Response(body, {
+    const stored = this.store.get(key)
+    if (!stored) return undefined
+    const res = new Response(stored.body, {
       status: 200,
-      headers: { 'Content-Type': 'application/json' },
+      headers: stored.headers,
     })
+    const origJson = res.json.bind(res)
+    res.json = () => {
+      this.jsonReadUrls.push(key)
+      return origJson()
+    }
+    return res
   }
 
   async put(request: RequestInfo | URL, response: Response): Promise<void> {
     const key = typeof request === 'string' ? request : request instanceof URL ? request.toString() : request.url
     const body = await response.text()
-    this.store.set(key, body)
+    const headers: Array<[string, string]> = []
+    response.headers.forEach((value, name) => {
+      headers.push([name, value])
+    })
+    if (!response.headers.has('content-type')) {
+      headers.push(['content-type', 'application/json'])
+    }
+    this.store.set(key, { body, headers })
   }
 
   async delete(request: RequestInfo | URL): Promise<boolean> {
@@ -501,6 +518,161 @@ async function runTests() {
       assert.equal(
         remainingKeys.includes('https://cache.local/archive/55.00,0.00'),
         true,
+      )
+    }
+
+    // 8. latestCompleteDate handles trailing ERA5 null days while keeping archiveEnd as targetEnd
+    {
+      resetArchiveForTest()
+      configureArchiveForTest({
+        yesterdayUtc: () => '2026-11-26',
+      })
+      const storage = new MockCacheStorage()
+      globalThis.caches = storage as unknown as CacheStorage
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            timezone: 'America/Toronto',
+            daily: {
+              time: ['1940-01-01', '2026-11-24', '2026-11-25', '2026-11-26'],
+              temperature_2m_max: [-2, 8, null, null],
+              temperature_2m_min: [-9, 1, null, null],
+              precipitation_sum: [0, 0.2, 0, null],
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )) as typeof fetch
+
+      const result = await loadDailyHistory(makePlace('ott-lag', 45.42, -75.7), {
+        preferredAnchor: '1970-01-01',
+      })
+      assert.equal(result.archiveEnd, '2026-11-26')
+      assert.equal(result.latestCompleteDate, '2026-11-24')
+
+      const v2 = await storage.open('analog-weather-archive-v2')
+      const persistedRes = await v2.match('https://cache.local/archive/45.42,-75.70')
+      const persisted = (await persistedRes!.json()) as CachedDailyHistory
+      assert.equal(persisted.archiveEnd, '2026-11-26')
+    }
+
+    // 9. Zero-parse Cache API LRU using X-Updated-At header (res.json() not called during eviction)
+    {
+      resetArchiveForTest()
+      let clock = 100_000
+      configureArchiveForTest({
+        now: () => {
+          clock += 100
+          return clock
+        },
+        yesterdayUtc: () => '2026-11-26',
+      })
+      const storage = new MockCacheStorage()
+      const v2 = (await storage.open('analog-weather-archive-v2')) as unknown as MockCache
+      for (let i = 0; i < 12; i++) {
+        const lat = (10 + i).toFixed(2)
+        const updatedAt = (i + 1) * 1000
+        const entry: CachedDailyHistory = {
+          version: 2,
+          startDate: ARCHIVE_START,
+          archiveEnd: '2026-11-26',
+          complete: true,
+          timezone: 'UTC',
+          updatedAt,
+          days: [{ date: '2026-11-26', tMax: 10, tMin: 2, precip: 0 }],
+        }
+        await v2.put(
+          `https://cache.local/archive/${lat},0.00`,
+          new Response(JSON.stringify(entry), {
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Updated-At': String(updatedAt),
+            },
+          }),
+        )
+      }
+
+      v2.jsonReadUrls.length = 0
+      globalThis.caches = storage as unknown as CacheStorage
+      globalThis.fetch = (async () =>
+        archiveJson(['1940-01-01', '2026-11-26'])) as typeof fetch
+
+      await loadDailyHistory(makePlace('extra2', 56, 0), {
+        preferredAnchor: '1970-01-01',
+      })
+
+      assert.deepEqual(v2.jsonReadUrls, [], 'eviction should read X-Updated-At header without calling res.json()')
+      const remainingKeys = (await v2.keys()).map((r) => r.url)
+      assert.equal(remainingKeys.length, 12)
+      assert.equal(
+        remainingKeys.includes('https://cache.local/archive/10.00,0.00'),
+        false,
+        'oldest X-Updated-At entry should be evicted',
+      )
+      assert.equal(
+        remainingKeys.includes('https://cache.local/archive/56.00,0.00'),
+        true,
+      )
+    }
+
+    // 10. Revisiting an older cached place refreshes recency and spares it on 13th insert
+    {
+      resetArchiveForTest()
+      let clock = 200_000
+      configureArchiveForTest({
+        now: () => clock,
+        yesterdayUtc: () => '2026-11-26',
+      })
+      const storage = new MockCacheStorage()
+      const v2 = await storage.open('analog-weather-archive-v2')
+      for (let i = 0; i < 12; i++) {
+        const lat = (20 + i).toFixed(2)
+        const updatedAt = (i + 1) * 1000
+        const entry: CachedDailyHistory = {
+          version: 2,
+          startDate: ARCHIVE_START,
+          archiveEnd: '2026-11-26',
+          complete: true,
+          timezone: 'UTC',
+          updatedAt,
+          days: [{ date: '2026-11-26', tMax: 10, tMin: 2, precip: 0 }],
+        }
+        await v2.put(
+          `https://cache.local/archive/${lat},0.00`,
+          new Response(JSON.stringify(entry), {
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Updated-At': String(updatedAt),
+            },
+          }),
+        )
+      }
+
+      globalThis.caches = storage as unknown as CacheStorage
+      globalThis.fetch = (async () =>
+        archiveJson(['1940-01-01', '2026-11-26'])) as typeof fetch
+
+      // Revisit place 0 (20.00,0.00) which has updatedAt = 1000 while clock = 200_000 (> 60s old)
+      await loadDailyHistory(makePlace('revisit', 20, 0))
+      // Allow fire-and-forget persistentCacheTouch to flush
+      await new Promise((r) => setTimeout(r, 0))
+
+      // Advance clock slightly and insert 13th place
+      clock = 201_000
+      await loadDailyHistory(makePlace('thirteenth', 57, 0), {
+        preferredAnchor: '1970-01-01',
+      })
+
+      const remainingKeys = (await v2.keys()).map((r) => r.url)
+      assert.equal(remainingKeys.length, 12)
+      assert.equal(
+        remainingKeys.includes('https://cache.local/archive/20.00,0.00'),
+        true,
+        'revisited place should have refreshed recency and be spared',
+      )
+      assert.equal(
+        remainingKeys.includes('https://cache.local/archive/21.00,0.00'),
+        false,
+        'place 1 (now oldest) should be evicted instead',
       )
     }
 

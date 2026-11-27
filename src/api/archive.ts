@@ -5,6 +5,7 @@ import {
   ARCHIVE_START_YEAR,
   DELTA_OVERLAP_DAYS,
   RECENT_WINDOW_YEARS,
+  findLatestCompleteDate,
   isValidCachedHistory,
   mergeDailyObservations,
   planArchiveFetch,
@@ -47,6 +48,7 @@ const historyCache = new Map<string, CachedDailyHistory>()
 const PERSISTENT_CACHE_NAME = 'analog-weather-archive-v2'
 const LEGACY_CACHE_NAME = 'analog-weather-archive-v1'
 const PERSISTENT_CACHE_MAX = 12
+const RECENCY_REFRESH_MS = 60_000
 
 let legacyCleanupDone = false
 let legacyCleanupPromise: Promise<void> | null = null
@@ -61,6 +63,8 @@ export type DailyHistory = {
   /** Complete or partial daily observations loaded, chronological (oldest → newest). */
   days: DailyObservation[]
   archiveEnd: string
+  /** Latest date with complete high/low/precip observations (handles ERA5 lag). */
+  latestCompleteDate: string
   timezone: string
 }
 
@@ -243,6 +247,13 @@ async function readUpdatedAt(cache: Cache, req: Request): Promise<number> {
   try {
     const res = await cache.match(req)
     if (!res || !res.ok) return Number.NEGATIVE_INFINITY
+    const headerVal = res.headers.get('X-Updated-At')
+    if (headerVal !== null && headerVal.trim() !== '') {
+      const parsedHeader = Number(headerVal)
+      if (Number.isFinite(parsedHeader)) {
+        return parsedHeader
+      }
+    }
     const parsed: unknown = await res.json()
     if (
       typeof parsed === 'object' &&
@@ -258,6 +269,43 @@ async function readUpdatedAt(cache: Cache, req: Request): Promise<number> {
   }
 }
 
+function buildCacheResponse(entry: CachedDailyHistory): Response {
+  return new Response(JSON.stringify(entry), {
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Updated-At': String(entry.updatedAt),
+    },
+  })
+}
+
+async function persistentCacheTouch(
+  place: Place,
+  entry: CachedDailyHistory,
+): Promise<void> {
+  const cache = await openPersistentCache()
+  if (!cache) return
+  try {
+    await cache.put(persistentCacheUrl(place), buildCacheResponse(entry))
+  } catch {
+    // Ignore storage/quota/privacy-mode errors.
+  }
+}
+
+function maybeRefreshRecency(
+  key: string,
+  place: Place,
+  entry: CachedDailyHistory,
+): CachedDailyHistory {
+  const now = getNow()
+  if (now - entry.updatedAt <= RECENCY_REFRESH_MS) {
+    return entry
+  }
+  const refreshed: CachedDailyHistory = { ...entry, updatedAt: now }
+  cacheSet(key, refreshed)
+  void persistentCacheTouch(place, refreshed)
+  return refreshed
+}
+
 async function persistentCacheSet(
   place: Place,
   entry: CachedDailyHistory,
@@ -266,13 +314,7 @@ async function persistentCacheSet(
   if (!cache) return
   try {
     const url = persistentCacheUrl(place)
-    await cache.delete(url)
-    await cache.put(
-      url,
-      new Response(JSON.stringify(entry), {
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    )
+    await cache.put(url, buildCacheResponse(entry))
 
     const keys = await cache.keys()
     if (keys.length <= PERSISTENT_CACHE_MAX) return
@@ -436,6 +478,8 @@ function toUpdate(
   return {
     days: history.days,
     archiveEnd: history.archiveEnd,
+    latestCompleteDate:
+      findLatestCompleteDate(history.days) ?? history.archiveEnd,
     timezone: history.timezone,
     coverageStart: history.startDate,
     isComplete: history.complete,
@@ -476,7 +520,8 @@ export function loadDailyHistory(
   const key = locationKey(place)
   const mem = cacheGet(key)
   if (mem && mem.complete && compareIsoDates(mem.archiveEnd, targetEnd) >= 0) {
-    const update = toUpdate(mem, 'complete')
+    const current = maybeRefreshRecency(key, place, mem)
+    const update = toUpdate(current, 'complete')
     onUpdate?.(update)
     return Promise.resolve(update)
   }
@@ -506,8 +551,9 @@ export function loadDailyHistory(
       })
 
       if (plan.kind === 'cache-hit' && cached) {
-        cacheSet(key, cached)
-        const update = toUpdate(cached, 'complete')
+        const current = maybeRefreshRecency(key, place, cached)
+        cacheSet(key, current)
+        const update = toUpdate(current, 'complete')
         emitUpdate(created, update)
         return update
       }

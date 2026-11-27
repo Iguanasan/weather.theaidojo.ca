@@ -3,6 +3,7 @@ import type { DailyObservation } from '../domain/types'
 import {
   ARCHIVE_START,
   computeRecentStart,
+  findLatestCompleteDate,
   isValidCachedHistory,
   mergeDailyObservations,
   planArchiveFetch,
@@ -237,5 +238,31 @@ for (const bad of [
 ]) {
   assert.equal(isValidCachedHistory(bad), false)
 }
+
+// 5. findLatestCompleteDate
+assert.equal(findLatestCompleteDate([]), null)
+assert.equal(
+  findLatestCompleteDate([
+    { date: '2026-11-24', tMax: null, tMin: null, precip: null },
+    { date: '2026-11-25', tMax: 5, tMin: null, precip: 0 },
+    { date: '2026-11-26', tMax: 6, tMin: 1, precip: null },
+  ]),
+  null,
+)
+assert.equal(
+  findLatestCompleteDate([
+    { date: '2026-11-23', tMax: 7, tMin: 1, precip: 0.4 },
+    { date: '2026-11-24', tMax: 8, tMin: 2, precip: 0 },
+  ]),
+  '2026-11-24',
+)
+assert.equal(
+  findLatestCompleteDate([
+    { date: '2026-11-23', tMax: 7, tMin: 1, precip: 0.4 },
+    { date: '2026-11-24', tMax: 8, tMin: 2, precip: null },
+    { date: '2026-11-25', tMax: null, tMin: null, precip: null },
+  ]),
+  '2026-11-23',
+)
 
 console.log('archiveMerge tests passed')

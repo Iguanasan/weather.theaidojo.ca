@@ -157,6 +157,20 @@ export function mergeDailyObservations(
   return merged
 }
 
+/**
+ * Scan backward from the end of `days` for the latest date with complete
+ * daily observations (`tMax`, `tMin`, `precip` all non-null).
+ */
+export function findLatestCompleteDate(days: DailyObservation[]): string | null {
+  for (let i = days.length - 1; i >= 0; i--) {
+    const d = days[i]!
+    if (d.tMax !== null && d.tMin !== null && d.precip !== null) {
+      return d.date
+    }
+  }
+  return null
+}
+
 function isNullableFiniteNumber(value: unknown): value is number | null {
   return value === null || (typeof value === 'number' && Number.isFinite(value))
 }
