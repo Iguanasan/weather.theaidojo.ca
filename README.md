@@ -32,8 +32,9 @@ Config lives in `wrangler.jsonc` (`not_found_handling: single-page-application` 
 1. Search a place (Open-Meteo geocoding)  
 2. Choose window: this day (1), week (7), or month (30 trailing days)  
 3. Live mode uses the latest archive day; Explorer picks any past anchor  
-4. Ranks **analog episodes**: full-year sliding search, best match per year  
-5. Overlay charts + shareable URL  
+4. Loads the recent 20 years first for fast initial matches, then backfills earlier records to 1940 and caches locally so return visits only fetch new days  
+5. Ranks **analog episodes**: full-year sliding search, best match per year  
+6. Overlay charts + shareable URL  
 
 Product definition: [PRODUCT.md](./PRODUCT.md)
 

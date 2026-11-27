@@ -114,7 +114,9 @@ export function AboutDialog({ open, onClose }: Props) {
             >
               Creative Commons Attribution 4.0
             </a>{' '}
-            licence.
+            licence. Recent years load first for fast results while earlier
+            records back to 1940 fill in behind the scenes, and saved places
+            update incrementally with only recent days on return visits.
           </p>
           <hr className="about-rule" />
           <h3 className="about-section-title">Location &amp; Privacy</h3>
