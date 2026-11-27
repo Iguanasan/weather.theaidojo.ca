@@ -39,15 +39,6 @@ export type AnalogSearchOptions = {
   minMatchStrength?: number
 }
 
-function rmse(a: number[], b: number[]): number {
-  let sum = 0
-  for (let i = 0; i < a.length; i++) {
-    const d = a[i]! - b[i]!
-    sum += d * d
-  }
-  return Math.sqrt(sum / a.length)
-}
-
 function blendedDistance(
   highRmse: number,
   lowRmse: number,
@@ -70,28 +61,25 @@ export function extractSeries(
   startIdx: number,
   length: number,
 ): WeatherSeries | null {
-  const slice = days.slice(startIdx, startIdx + length)
-  if (slice.length !== length) return null
+  if (startIdx < 0 || startIdx + length > days.length) return null
 
   const dates: string[] = []
   const tMax: number[] = []
   const tMin: number[] = []
-  const tMean: number[] = []
   const precip: number[] = []
 
-  for (const d of slice) {
+  for (let k = 0; k < length; k++) {
+    const d = days[startIdx + k]!
     if (d.tMax == null || d.tMin == null || d.precip == null) {
       return null
     }
     dates.push(d.date)
     tMax.push(d.tMax)
     tMin.push(d.tMin)
-    // Mean is display-only fallback; high/low drive matching.
-    tMean.push(d.tMean ?? (d.tMax + d.tMin) / 2)
     precip.push(d.precip)
   }
 
-  return { dates, tMax, tMin, tMean, precip }
+  return { dates, tMax, tMin, precip }
 }
 
 function yearOf(isoDate: string): number {
@@ -125,51 +113,91 @@ export function findBestAnalogInYear(
   } = options
   if (focal.tMax.length !== length || days.length < length) return null
 
-  let best: AnalogEpisode | null = null
+  const focalTMax = focal.tMax
+  const focalTMin = focal.tMin
+  const focalPrecip = focal.precip
+
+  let bestIdx = -1
+  let bestDistance = Infinity
+  let bestHighRmse = 0
+  let bestLowRmse = 0
+  let bestPrecipRmse = 0
 
   for (let i = 0; i <= days.length - length; i++) {
-    const series = extractSeries(days, i, length)
-    if (!series) continue
-
-    const startDate = series.dates[0]!
-    const endDate = series.dates[length - 1]!
-
+    const startDate = days[i]!.date
+    const endDate = days[i + length - 1]!.date
     if (datesOverlap(startDate, endDate, focalStart, focalEnd)) continue
 
-    const tempHighRmse = rmse(focal.tMax, series.tMax)
-    const tempLowRmse = rmse(focal.tMin, series.tMin)
-    const precipRmse = rmse(focal.precip, series.precip)
+    let sumHigh = 0
+    let sumLow = 0
+    let sumPrecip = 0
+    let valid = true
+
+    for (let k = 0; k < length; k++) {
+      const d = days[i + k]!
+      if (d.tMax == null || d.tMin == null || d.precip == null) {
+        valid = false
+        break
+      }
+      const dh = focalTMax[k]! - d.tMax
+      const dl = focalTMin[k]! - d.tMin
+      const dp = focalPrecip[k]! - d.precip
+      sumHigh += dh * dh
+      sumLow += dl * dl
+      sumPrecip += dp * dp
+    }
+
+    if (!valid) continue
+
+    const tempHighRmse = Math.sqrt(sumHigh / length)
+    const tempLowRmse = Math.sqrt(sumLow / length)
+    const precipRmse = Math.sqrt(sumPrecip / length)
     const distance = blendedDistance(tempHighRmse, tempLowRmse, precipRmse)
 
-    if (!best || distance < best.distance) {
-      best = {
-        year,
-        startDate,
-        endDate,
-        series,
-        distance,
-        matchStrength: matchStrengthFromDistance(distance),
-        tempHighRmse,
-        tempLowRmse,
-        precipRmse,
-      }
+    if (distance < bestDistance) {
+      bestDistance = distance
+      bestIdx = i
+      bestHighRmse = tempHighRmse
+      bestLowRmse = tempLowRmse
+      bestPrecipRmse = precipRmse
     }
   }
 
-  if (best && best.matchStrength >= minMatchStrength) return best
-  return null
+  if (bestIdx < 0) return null
+  const matchStrength = matchStrengthFromDistance(bestDistance)
+  if (matchStrength < minMatchStrength) return null
+
+  const series = extractSeries(days, bestIdx, length)
+  if (!series) return null
+
+  return {
+    year,
+    startDate: series.dates[0]!,
+    endDate: series.dates[length - 1]!,
+    series,
+    distance: bestDistance,
+    matchStrength,
+    tempHighRmse: bestHighRmse,
+    tempLowRmse: bestLowRmse,
+    precipRmse: bestPrecipRmse,
+  }
 }
 
 /**
- * Score only the years present in `history` (used for progressive chunks).
- * Does not re-score years outside this slice.
+ * Full-year sliding-window search: for each calendar year, score every
+ * L-length window on daily high + low + precip vs the focal series; keep
+ * the best episode per year that is similar enough; return newest first.
+ *
+ * Order answers “when did it last feel like this?” — not “which year is
+ * mathematically closest.” Highs and lows are matched separately so a heat
+ * wave is not confused with a mild week that only shares the same mean.
  */
-export function findAnalogEpisodesInSlice(
+export function findAnalogEpisodes(
   history: DailyObservation[],
   focal: WeatherSeries,
   options: AnalogSearchOptions,
 ): AnalogEpisode[] {
-  const { length } = options
+  const { length, topN = 24 } = options
   if (focal.tMax.length !== length || history.length < length) return []
 
   const byYear = new Map<number, DailyObservation[]>()
@@ -189,59 +217,23 @@ export function findAnalogEpisodesInSlice(
     const best = findBestAnalogInYear(year, days, focal, options)
     if (best) found.push(best)
   }
-  return found
-}
 
-/** Merge per-year winners; keep closer episode when the same year appears twice. */
-export function mergeAnalogEpisodes(
-  existing: AnalogEpisode[],
-  incoming: AnalogEpisode[],
-  topN = 24,
-): AnalogEpisode[] {
-  const byYear = new Map<number, AnalogEpisode>()
-  for (const ep of existing) byYear.set(ep.year, ep)
-  for (const ep of incoming) {
-    const prev = byYear.get(ep.year)
-    if (!prev || ep.distance < prev.distance) byYear.set(ep.year, ep)
-  }
-  const merged = [...byYear.values()]
-  merged.sort((a, b) =>
+  found.sort((a, b) =>
     a.endDate < b.endDate ? 1 : a.endDate > b.endDate ? -1 : 0,
   )
-  return merged.slice(0, topN)
-}
-
-/**
- * Full-year sliding-window search: for each calendar year, score every
- * L-length window on daily high + low + precip vs the focal series; keep
- * the best episode per year that is similar enough; return newest first.
- *
- * Order answers “when did it last feel like this?” — not “which year is
- * mathematically closest.” Highs and lows are matched separately so a heat
- * wave is not confused with a mild week that only shares the same mean.
- */
-export function findAnalogEpisodes(
-  history: DailyObservation[],
-  focal: WeatherSeries,
-  options: AnalogSearchOptions,
-): AnalogEpisode[] {
-  const { topN = 24 } = options
-  const found = findAnalogEpisodesInSlice(history, focal, options)
-  return mergeAnalogEpisodes([], found, topN)
+  return found.slice(0, topN)
 }
 
 export function seriesStats(series: WeatherSeries): {
   avgHigh: number
   avgLow: number
-  avgMean: number
   totalPrecip: number
 } {
   const n = Math.max(series.tMax.length, 1)
   const avgHigh = series.tMax.reduce((s, v) => s + v, 0) / n
   const avgLow = series.tMin.reduce((s, v) => s + v, 0) / n
-  const avgMean = series.tMean.reduce((s, v) => s + v, 0) / n
   const totalPrecip = series.precip.reduce((s, v) => s + v, 0)
-  return { avgHigh, avgLow, avgMean, totalPrecip }
+  return { avgHigh, avgLow, totalPrecip }
 }
 
 /**

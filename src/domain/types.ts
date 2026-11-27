@@ -15,11 +15,6 @@ export type Place = {
 export type DailyObservation = {
   /** ISO date YYYY-MM-DD in the place's local calendar. */
   date: string
-  /**
-   * 24h mean °C when available. Optional — matching uses high/low only;
-   * archive fetch may omit mean to reduce payload.
-   */
-  tMean?: number | null
   tMax: number | null
   tMin: number | null
   /** Precipitation total mm. */
@@ -32,8 +27,6 @@ export type WeatherSeries = {
   tMax: number[]
   /** Daily low °C (whether nights cool off). */
   tMin: number[]
-  /** 24h mean °C (kept for secondary stats). */
-  tMean: number[]
   precip: number[]
 }
 

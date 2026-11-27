@@ -9,7 +9,6 @@ function series(
     dates: days.map((_, i) => `2020-06-${String(i + 1).padStart(2, '0')}`),
     tMax: days.map((d) => d.high),
     tMin: days.map((d) => d.low),
-    tMean: days.map((d) => (d.high + d.low) / 2),
     precip: days.map((d) => d.precip),
   }
 }
