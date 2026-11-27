@@ -95,6 +95,13 @@ function datesOverlap(
   return aStart <= bEnd && bStart <= aEnd
 }
 
+function isChronological(days: DailyObservation[]): boolean {
+  for (let i = 1; i < days.length; i++) {
+    if (days[i - 1]!.date > days[i]!.date) return false
+  }
+  return true
+}
+
 /** Best L-day window within one year's daily rows (already chronological). */
 export function findBestAnalogInYear(
   year: number,
@@ -213,7 +220,9 @@ export function findAnalogEpisodes(
 
   const found: AnalogEpisode[] = []
   for (const [year, days] of byYear) {
-    days.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
+    if (!isChronological(days)) {
+      days.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
+    }
     const best = findBestAnalogInYear(year, days, focal, options)
     if (best) found.push(best)
   }

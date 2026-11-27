@@ -203,4 +203,31 @@ for (const badCc of ['USA', 'C', '12', 'C1', '1A', 'C$', '', '   ']) {
   assert.equal(params.get('lon'), '0')
 }
 
+// 8. Future-date upper bound on anchorDate
+{
+  assert.equal(
+    parseQueryParams(makeSearch({ anchor: '2099-01-01' })).anchorDate,
+    null,
+    'far-future anchor should be rejected by default maxDate',
+  )
+
+  const maxDate = '2026-05-10'
+  assert.equal(
+    parseQueryParams(makeSearch({ anchor: '2026-05-10' }), maxDate).anchorDate,
+    '2026-05-10',
+  )
+  assert.equal(
+    parseQueryParams(makeSearch({ anchor: '2026-05-09' }), maxDate).anchorDate,
+    '2026-05-09',
+  )
+  assert.equal(
+    parseQueryParams(makeSearch({ anchor: '2026-05-11' }), maxDate).anchorDate,
+    null,
+  )
+  assert.equal(
+    parseQueryParams(makeSearch({ anchor: '2027-01-01' }), maxDate).anchorDate,
+    null,
+  )
+}
+
 console.log('urlState.test.ts: all assertions passed')

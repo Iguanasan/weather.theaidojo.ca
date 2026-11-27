@@ -33,8 +33,17 @@ function capString(raw: string | null, maxLen: number): string | undefined {
   return capped || undefined
 }
 
-function isValidAnchorDate(raw: string | null): raw is string {
-  if (!raw || !ISO_DATE_RE.test(raw) || raw < MIN_ANCHOR_DATE) return false
+function todayUtc(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+function isValidAnchorDate(
+  raw: string | null,
+  maxDate = todayUtc(),
+): raw is string {
+  if (!raw || !ISO_DATE_RE.test(raw) || raw < MIN_ANCHOR_DATE || raw > maxDate) {
+    return false
+  }
   const [yStr, mStr, dStr] = raw.split('-')
   const year = Number(yStr)
   const month = Number(mStr)
@@ -53,7 +62,10 @@ function round2(v: number): number {
   return r === 0 ? 0 : r
 }
 
-export function parseQueryParams(search: string): Partial<AppQuery> & {
+export function parseQueryParams(
+  search: string,
+  maxDate?: string,
+): Partial<AppQuery> & {
   placeHint?: Place
 } {
   const params = new URLSearchParams(search)
@@ -83,7 +95,7 @@ export function parseQueryParams(search: string): Partial<AppQuery> & {
   return {
     placeHint,
     length: parseLength(params.get('L')),
-    anchorDate: isValidAnchorDate(anchor) ? anchor : null,
+    anchorDate: isValidAnchorDate(anchor, maxDate) ? anchor : null,
   }
 }
 

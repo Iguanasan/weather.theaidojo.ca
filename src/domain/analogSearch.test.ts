@@ -112,6 +112,19 @@ const limited = findAnalogEpisodes(historyWithFocal, focal, {
 assert.equal(limited.length, 1, 'topN should cap returned episodes')
 assert.equal(limited[0]!.year, 2018, 'topN: 1 returns newest qualifying year')
 
+// Out-of-order input rows still produce identical matches
+const unsortedResults = findAnalogEpisodes([...historyWithFocal].reverse(), focal, {
+  length: 7,
+  focalStart: '2020-07-01',
+  focalEnd: '2020-07-07',
+  topN: 10,
+})
+assert.deepEqual(
+  unsortedResults,
+  results,
+  'unsorted history rows should produce identical analog matches',
+)
+
 // Tie behavior in findBestAnalogInYear: earlier equal-distance window wins
 const tiedFocal = extractSeries([day('2020-06-01', 20, 0)], 0, 1)!
 const tiedYear = [
