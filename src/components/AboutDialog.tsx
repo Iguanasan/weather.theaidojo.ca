@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 
 type Props = {
   open: boolean
@@ -9,6 +9,22 @@ type Props = {
  * Standard app About dialog — developer credit and data attribution.
  */
 export function AboutDialog({ open, onClose }: Props) {
+  const closeBtnRef = useRef<HTMLButtonElement | null>(null)
+  const openerRef = useRef<HTMLElement | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+    openerRef.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null
+    closeBtnRef.current?.focus()
+    return () => {
+      openerRef.current?.focus()
+      openerRef.current = null
+    }
+  }, [open])
+
   useEffect(() => {
     if (!open) return
     const onKey = (e: KeyboardEvent) => {
@@ -34,6 +50,7 @@ export function AboutDialog({ open, onClose }: Props) {
             About
           </h2>
           <button
+            ref={closeBtnRef}
             type="button"
             className="icon-btn about-close"
             onClick={onClose}

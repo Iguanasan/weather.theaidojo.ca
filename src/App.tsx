@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ARCHIVE_START,
   OPEN_METEO_TERMS_URL,
@@ -11,10 +11,15 @@ import { detectCurrentPlace, formatPlaceLabel } from './api/geocode'
 import { AboutDialog } from './components/AboutDialog'
 import { AnalogList } from './components/AnalogList'
 import { LoadingWeather } from './components/LoadingWeather'
-import { OverlayCharts } from './components/OverlayCharts'
 import { PlaceSearch } from './components/PlaceSearch'
 import { ThemeToggle } from './components/ThemeToggle'
 import { WeatherBackground } from './components/WeatherBackground'
+
+const OverlayCharts = lazy(() =>
+  import('./components/OverlayCharts').then((m) => ({
+    default: m.OverlayCharts,
+  })),
+)
 import { findAnalogEpisodes, seriesStats } from './domain/analogSearch'
 import { classifyAtmosphere, getAtmosphereMeta } from './domain/atmosphere'
 import type {
@@ -51,6 +56,7 @@ export default function App() {
 
   const [days, setDays] = useState<DailyObservation[] | null>(null)
   const [archiveEnd, setArchiveEnd] = useState<string | null>(null)
+  const [latestCompleteDate, setLatestCompleteDate] = useState<string | null>(null)
   const [coverageStart, setCoverageStart] = useState<string | null>(null)
   /** Progressive history loading phase for the selected place. */
   const [historyPhase, setHistoryPhase] = useState<HistoryLoadPhase | null>(null)
@@ -68,6 +74,7 @@ export default function App() {
   const [aboutOpen, setAboutOpen] = useState(false)
 
   const abortRef = useRef<AbortController | null>(null)
+  const locateAbortRef = useRef<AbortController | null>(null)
   const loadedPlaceKeyRef = useRef<string | null>(null)
   const hasDaysRef = useRef(false)
   const liveModeRef = useRef(liveMode)
@@ -76,7 +83,8 @@ export default function App() {
   liveModeRef.current = liveMode
   anchorDateRef.current = anchorDate
 
-  const effectiveAnchor = liveMode ? archiveEnd : anchorDate
+  const latestAnchor = latestCompleteDate ?? archiveEnd
+  const effectiveAnchor = liveMode ? latestAnchor : anchorDate
   const units = unitsForPlace(place)
 
   const query: AppQuery = useMemo(
@@ -93,48 +101,62 @@ export default function App() {
   }, [query])
 
   const locateUser = useCallback(async (onlyIfEmpty = false) => {
+    locateAbortRef.current?.abort()
+    const ac = new AbortController()
+    locateAbortRef.current = ac
     setLocating(true)
     setLocationHint(null)
     try {
-      const p = await detectCurrentPlace()
+      const p = await detectCurrentPlace({ signal: ac.signal })
+      if (ac.signal.aborted) return
       setPlace((current) => {
         if (onlyIfEmpty && current) return current
         return p
       })
     } catch (e) {
-      if ((e as Error).name === 'AbortError') return
+      if (ac.signal.aborted || (e as Error).name === 'AbortError') return
       setLocationHint(
         (e as Error).message ||
           'Could not detect location — search for a place instead.',
       )
     } finally {
-      setLocating(false)
+      if (locateAbortRef.current === ac) {
+        locateAbortRef.current = null
+      }
+      if (!ac.signal.aborted) {
+        setLocating(false)
+      }
     }
   }, [])
 
   // Default to the user's current location when the URL has no place.
   useEffect(() => {
     if (hadPlaceInUrl) return
-    let active = true
+    locateAbortRef.current?.abort()
+    const ac = new AbortController()
+    locateAbortRef.current = ac
     setLocating(true)
     setLocationHint(null)
-    detectCurrentPlace()
+    detectCurrentPlace({ signal: ac.signal })
       .then((p) => {
-        if (!active) return
+        if (ac.signal.aborted) return
         setPlace((current) => current ?? p)
       })
       .catch((e) => {
-        if (!active || (e as Error).name === 'AbortError') return
+        if (ac.signal.aborted || (e as Error).name === 'AbortError') return
         setLocationHint(
           (e as Error).message ||
             'Could not detect location — search for a place instead.',
         )
       })
       .finally(() => {
-        if (active) setLocating(false)
+        if (locateAbortRef.current === ac) {
+          locateAbortRef.current = null
+        }
+        if (!ac.signal.aborted) setLocating(false)
       })
     return () => {
-      active = false
+      ac.abort()
     }
   }, [hadPlaceInUrl])
 
@@ -144,6 +166,7 @@ export default function App() {
       loadedPlaceKeyRef.current = null
       setDays(null)
       setArchiveEnd(null)
+      setLatestCompleteDate(null)
       setCoverageStart(null)
       setAnalogs([])
       setSelected(null)
@@ -153,7 +176,9 @@ export default function App() {
       return
     }
 
-    const nextPlaceKey = `${place.latitude.toFixed(2)},${place.longitude.toFixed(2)}`
+    const formatCoordKey = (v: number) =>
+      (Math.abs(v) < 0.005 ? 0 : v).toFixed(2)
+    const nextPlaceKey = `${formatCoordKey(place.latitude)},${formatCoordKey(place.longitude)}`
     const isNewPlace = loadedPlaceKeyRef.current !== nextPlaceKey
     loadedPlaceKeyRef.current = nextPlaceKey
 
@@ -166,6 +191,7 @@ export default function App() {
       setHistoryPhase('loading')
       setDays(null)
       setArchiveEnd(null)
+      setLatestCompleteDate(null)
       setCoverageStart(null)
       setAnalogs([])
       setSelected(null)
@@ -182,11 +208,12 @@ export default function App() {
             if (ac.signal.aborted) return
             setDays(update.days)
             setArchiveEnd(update.archiveEnd)
+            setLatestCompleteDate(update.latestCompleteDate)
             setCoverageStart(update.coverageStart)
             setHistoryPhase(update.phase)
             setBackgroundError(update.backgroundError ?? null)
             if (liveModeRef.current || !anchorDateRef.current) {
-              setAnchorDate(update.archiveEnd)
+              setAnchorDate(update.latestCompleteDate)
             }
           },
         })
@@ -265,6 +292,10 @@ export default function App() {
   }, [sortedAnalogs])
 
   const onSelectPlace = useCallback((p: Place) => {
+    locateAbortRef.current?.abort()
+    locateAbortRef.current = null
+    setLocating(false)
+    setLocationHint(null)
     setPlace(p)
   }, [])
 
@@ -273,14 +304,14 @@ export default function App() {
     Boolean(place && effectiveAnchor) &&
     compareIsoDates(stepPeriodAnchor(effectiveAnchor!, length, -1), minAnchor) >= 0
   const canStepNext =
-    Boolean(place && effectiveAnchor && archiveEnd) &&
-    compareIsoDates(effectiveAnchor!, archiveEnd!) < 0
+    Boolean(place && effectiveAnchor && latestAnchor) &&
+    compareIsoDates(effectiveAnchor!, latestAnchor!) < 0
 
   function stepPeriod(direction: -1 | 1) {
     if (!effectiveAnchor) return
     let next = stepPeriodAnchor(effectiveAnchor, length, direction)
     if (compareIsoDates(next, minAnchor) < 0) next = minAnchor
-    if (archiveEnd && compareIsoDates(next, archiveEnd) > 0) next = archiveEnd
+    if (latestAnchor && compareIsoDates(next, latestAnchor) > 0) next = latestAnchor
     setLiveMode(false)
     setAnchorDate(next)
   }
@@ -402,7 +433,7 @@ export default function App() {
                 className={liveMode ? 'active' : ''}
                 onClick={() => {
                   setLiveMode(true)
-                  if (archiveEnd) setAnchorDate(archiveEnd)
+                  if (latestAnchor) setAnchorDate(latestAnchor)
                 }}
               >
                 Live
@@ -453,7 +484,7 @@ export default function App() {
                 id="anchor-date"
                 type="date"
                 value={effectiveAnchor ?? ''}
-                max={archiveEnd ?? undefined}
+                max={latestAnchor ?? undefined}
                 min={minAnchor}
                 disabled={!place}
                 onChange={(e) => {
@@ -650,12 +681,6 @@ export default function App() {
                   Checking for latest days…
                 </span>
               )}
-              {days && historyPhase === 'backfilling' && !historyError && (
-                <span className="muted status-sync">
-                  {' '}
-                  Loading earlier archive back to 1940…
-                </span>
-              )}
             </div>
           </section>
 
@@ -770,11 +795,13 @@ export default function App() {
                     close {selected.matchStrength.toFixed(0)}
                   </p>
                 )}
-                <OverlayCharts
-                  focal={focal.series}
-                  analog={selected}
-                  units={units}
-                />
+                <Suspense fallback={<p className="muted">Loading charts…</p>}>
+                  <OverlayCharts
+                    focal={focal.series}
+                    analog={selected}
+                    units={units}
+                  />
+                </Suspense>
               </div>
             </section>
           )}

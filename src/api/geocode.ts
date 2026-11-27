@@ -144,7 +144,9 @@ export function detectCurrentPlace(options?: {
 
   // Reuse a single browser request when callers overlap (e.g. Strict Mode).
   if (!detectInflight) {
-    detectInflight = runDetectCurrentPlace(options).finally(() => {
+    detectInflight = runDetectCurrentPlace({
+      timeoutMs: options?.timeoutMs,
+    }).finally(() => {
       detectInflight = null
     })
   }

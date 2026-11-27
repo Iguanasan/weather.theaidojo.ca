@@ -21,6 +21,7 @@ export function PlaceSearch({
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const containerRef = useRef<HTMLDivElement | null>(null)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const abortRef = useRef<AbortController | null>(null)
 
@@ -35,11 +36,34 @@ export function PlaceSearch({
     }
   }, [])
 
+  useEffect(() => {
+    if (!open) return
+    const onPointerDown = (e: PointerEvent) => {
+      if (!containerRef.current?.contains(e.target as Node)) {
+        setOpen(false)
+      }
+    }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setOpen(false)
+      }
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [open])
+
   function onChange(value: string) {
     setText(value)
     setError(null)
     if (debounceRef.current) clearTimeout(debounceRef.current)
     if (value.trim().length < 2) {
+      abortRef.current?.abort()
+      abortRef.current = null
+      setLoading(false)
       setResults([])
       setOpen(false)
       return
@@ -51,19 +75,29 @@ export function PlaceSearch({
       setLoading(true)
       try {
         const places = await searchPlaces(value, ac.signal)
+        if (abortRef.current !== ac) return
         setResults(places)
         setOpen(true)
       } catch (e) {
-        if ((e as Error).name === 'AbortError') return
+        if (abortRef.current !== ac || (e as Error).name === 'AbortError') return
         setError('Could not search places')
         setResults([])
       } finally {
-        setLoading(false)
+        if (abortRef.current === ac) {
+          setLoading(false)
+        }
       }
     }, 280)
   }
 
   function pick(place: Place) {
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current)
+      debounceRef.current = null
+    }
+    abortRef.current?.abort()
+    abortRef.current = null
+    setLoading(false)
     onSelect(place)
     setText(formatPlaceLabel(place))
     setOpen(false)
@@ -71,7 +105,7 @@ export function PlaceSearch({
   }
 
   return (
-    <div className="place-search">
+    <div className="place-search" ref={containerRef}>
       <label className="field-label" htmlFor="place-input">
         Place
       </label>
